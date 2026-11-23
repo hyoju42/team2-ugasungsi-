@@ -1,0 +1,8 @@
+.venv/
+.idea/
+__pycache__/
+**__pycache__/
+migrations/
+instance/
+*.db
+data/kat_sale_citrus_merged.csv

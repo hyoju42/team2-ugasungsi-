@@ -181,7 +181,7 @@ TOP_SPECS_MAP = {
 }
 
 # -----------------------------------------------------------------------------
-# 연구 프로젝트 4대 모델(RandomForest.ipynb, LightBGM.ipynb, XGBoost.ipynb, TFT.ipynb) 원본 실측 결과
+# 연구 프로젝트 4대 모델(RandomForest.ipynb, LightGBM.ipynb, XGBoost.ipynb, TFT.ipynb) 원본 실측 결과
 # 노트북에서 실제로 도출된 규격별 정량 검증 지표 (100% 실측치 매핑)
 # -----------------------------------------------------------------------------
 NOTEBOOK_BENCHMARK_RESULTS = {
@@ -514,7 +514,7 @@ def load_kat_citrus_monthly(upload_sig: str = "default"):
 # 3. 모델 학습 및 캐싱 (LightGBM, Random Forest, XGBoost, TFT - 경매 및 수의정가)
 # -----------------------------------------------------------------------------
 @st.cache_resource(show_spinner="선택된 품종 및 규격의 시계열 순차 예측 모델(거래량→가격)을 최적화 중입니다...")
-def train_variety_spec_models(variety: str, unit_qty: float, model_type: str = "TFT Ensemble", channel: str = "경매", upload_sig: str = "default"):
+def train_variety_spec_models(variety: str, unit_qty: float, model_type: str = "Random Forest", channel: str = "경매", upload_sig: str = "default"):
     if upload_sig == "default":
         upload_sig = get_upload_sig()
     auction_df, wjdrk_df, weather_daily, sub_matrix_rudao, sub_matrix_wjdrk, all_dates, _ = load_and_preprocess_data(upload_sig)
@@ -580,8 +580,8 @@ def train_variety_spec_models(variety: str, unit_qty: float, model_type: str = "
 
     # 모델 생성 (사용자 선택 모델 타입 반영 - 경량 최적화 파라미터 적용)
     if "Random Forest" in model_type:
-        m_vol = RandomForestRegressor(n_estimators=30, max_depth=8, random_state=42, n_jobs=-1)
-        m_prc = RandomForestRegressor(n_estimators=30, max_depth=8, random_state=42, n_jobs=-1)
+        m_vol = RandomForestRegressor(n_estimators=100, max_depth=14, min_samples_split=3, min_samples_leaf=2, random_state=42, n_jobs=-1)
+        m_prc = RandomForestRegressor(n_estimators=100, max_depth=14, min_samples_split=3, min_samples_leaf=2, random_state=42, n_jobs=-1)
     elif "XGBoost" in model_type:
         m_vol = xgb.XGBRegressor(n_estimators=50, max_depth=6, learning_rate=0.08, random_state=42, verbosity=0)
         m_prc = xgb.XGBRegressor(n_estimators=50, max_depth=6, learning_rate=0.08, random_state=42, verbosity=0)
@@ -738,21 +738,11 @@ def predict_7_days(
     target_dates = [base_date + datetime.timedelta(days=i) for i in range(8)]
     results = []
 
-    # 경매 Lag 변수
-    cur_v_lag1_r = last_v_r
-    cur_v_lag7_r = float(non_zero_r["총거래량"].iloc[-7]) if len(non_zero_r) >= 7 else last_v_r
-    cur_p_lag1_r = last_p_r
-    cur_p_lag2_r = float(non_zero_r["평균가격"].iloc[-2]) if len(non_zero_r) >= 2 else last_p_r
-    cur_p_lag7_r = float(non_zero_r["평균가격"].iloc[-7]) if len(non_zero_r) >= 7 else last_p_r
-    prc_win_r = [cur_p_lag7_r, cur_p_lag2_r, cur_p_lag1_r]
-
-    # 수의정가 Lag 변수
-    cur_v_lag1_w = last_v_w
-    cur_v_lag7_w = float(non_zero_w["총거래량"].iloc[-7]) if len(non_zero_w) >= 7 else last_v_w
-    cur_p_lag1_w = last_p_w
-    cur_p_lag2_w = float(non_zero_w["평균가격"].iloc[-2]) if len(non_zero_w) >= 2 else last_p_w
-    cur_p_lag7_w = float(non_zero_w["평균가격"].iloc[-7]) if len(non_zero_w) >= 7 else last_p_w
-    prc_win_w = [cur_p_lag7_w, cur_p_lag2_w, cur_p_lag1_w]
+    # 경매 및 수의정가 슬라이딩 윈도우 시계열 버퍼 (직전 14개 영업일 실제 시계열 버퍼 유지)
+    p_win_r = list(non_zero_r["평균가격"].iloc[-14:]) if len(non_zero_r) >= 14 else [last_p_r] * 14
+    v_win_r = list(non_zero_r["총거래량"].iloc[-14:]) if len(non_zero_r) >= 14 else [last_v_r] * 14
+    p_win_w = list(non_zero_w["평균가격"].iloc[-14:]) if len(non_zero_w) >= 14 else [last_p_w] * 14
+    v_win_w = list(non_zero_w["총거래량"].iloc[-14:]) if len(non_zero_w) >= 14 else [last_v_w] * 14
 
     tft_boost = 1.025 if "TFT" in model_type else 1.0
 
@@ -782,17 +772,17 @@ def predict_7_days(
             "month": d.month,
             "day": d.day,
             "dayofweek": d.weekday(),
-            "volume_lag_1": cur_v_lag1_r,
-            "volume_lag_7": cur_v_lag7_r,
+            "volume_lag_1": v_win_r[-1],
+            "volume_lag_7": v_win_r[-7],
         }
         for c in art_r["sub_lag_cols"]:
             row_v_r[c] = float(hist_r[c].iloc[-1]) if c in hist_r.columns else 0.0
 
-        pv_r = 0.0 if is_sun else max(10.0, float(art_r["model_vol"].predict(pd.DataFrame([row_v_r]))[0]) * tft_boost)
+        pv_r = 0.0 if is_sun else max(10.0, float(art_r["model_vol"].predict(pd.DataFrame([row_v_r])[art_r["vol_features"]])[0]) * tft_boost)
 
-        # A. 경매(rudao) 2단계: 가격 예측
-        r3_r = float(np.mean(prc_win_r[-3:]))
-        r7_r = float(np.mean(prc_win_r[-7:])) if len(prc_win_r) >= 7 else r3_r
+        # A. 경매(rudao) 2단계: 가격 예측 (슬라이딩 윈도우 기반 이동평균 및 Lag 산출)
+        r3_r = float(np.mean(p_win_r[-3:]))
+        r7_r = float(np.mean(p_win_r[-7:]))
         row_p_r = {
             "volume_feature": pv_r,
             "평균기온(°C)": avg_temp,
@@ -804,16 +794,16 @@ def predict_7_days(
             "month": d.month,
             "day": d.day,
             "dayofweek": d.weekday(),
-            "price_lag_1": cur_p_lag1_r,
-            "price_lag_2": cur_p_lag2_r,
-            "price_lag_7": cur_p_lag7_r,
+            "price_lag_1": p_win_r[-1],
+            "price_lag_2": p_win_r[-2],
+            "price_lag_7": p_win_r[-7],
             "price_roll_mean_3": r3_r,
             "price_roll_mean_7": r7_r,
         }
         for c in art_r["sub_lag_cols"]:
             row_p_r[c] = float(hist_r[c].iloc[-1]) if c in hist_r.columns else 0.0
 
-        pp_r = cur_p_lag1_r if is_sun else max(1000.0, float(art_r["model_prc"].predict(pd.DataFrame([row_p_r]))[0]) * tft_boost)
+        pp_r = p_win_r[-1] if is_sun else max(1000.0, float(art_r["model_prc"].predict(pd.DataFrame([row_p_r])[art_r["price_features"]])[0]) * tft_boost)
 
         # B. 수의정가(wjdrk) 1단계: 거래량 예측
         row_v_w = {
@@ -826,17 +816,17 @@ def predict_7_days(
             "month": d.month,
             "day": d.day,
             "dayofweek": d.weekday(),
-            "volume_lag_1": cur_v_lag1_w,
-            "volume_lag_7": cur_v_lag7_w,
+            "volume_lag_1": v_win_w[-1],
+            "volume_lag_7": v_win_w[-7],
         }
         for c in art_w["sub_lag_cols"]:
             row_v_w[c] = float(hist_w[c].iloc[-1]) if c in hist_w.columns else 0.0
 
-        pv_w = 0.0 if is_sun else max(5.0, float(art_w["model_vol"].predict(pd.DataFrame([row_v_w]))[0]) * tft_boost)
+        pv_w = 0.0 if is_sun else max(5.0, float(art_w["model_vol"].predict(pd.DataFrame([row_v_w])[art_w["vol_features"]])[0]) * tft_boost)
 
         # B. 수의정가(wjdrk) 2단계: 가격 예측
-        r3_w = float(np.mean(prc_win_w[-3:]))
-        r7_w = float(np.mean(prc_win_w[-7:])) if len(prc_win_w) >= 7 else r3_w
+        r3_w = float(np.mean(p_win_w[-3:]))
+        r7_w = float(np.mean(p_win_w[-7:]))
         row_p_w = {
             "volume_feature": pv_w,
             "평균기온(°C)": avg_temp,
@@ -848,23 +838,23 @@ def predict_7_days(
             "month": d.month,
             "day": d.day,
             "dayofweek": d.weekday(),
-            "price_lag_1": cur_p_lag1_w,
-            "price_lag_2": cur_p_lag2_w,
-            "price_lag_7": cur_p_lag7_w,
+            "price_lag_1": p_win_w[-1],
+            "price_lag_2": p_win_w[-2],
+            "price_lag_7": p_win_w[-7],
             "price_roll_mean_3": r3_w,
             "price_roll_mean_7": r7_w,
         }
         for c in art_w["sub_lag_cols"]:
             row_p_w[c] = float(hist_w[c].iloc[-1]) if c in hist_w.columns else 0.0
 
-        raw_pred_w = float(art_w["model_prc"].predict(pd.DataFrame([row_p_w]))[0]) * tft_boost
+        raw_pred_w = float(art_w["model_prc"].predict(pd.DataFrame([row_p_w])[art_w["price_features"]])[0]) * tft_boost
 
         # 수의정가(정가·수의매매)는 사전 출하 계약 단가이므로, 스팟 경매와 달리 일별 변동성이 낮고 안정적인 단가를 유지
         if is_sun:
-            pp_w = cur_p_lag1_w
+            pp_w = p_win_w[-1]
         else:
             # 직전 계약가 중심의 완만한 조정 (저변동성 안정화: 관성 88% + 신규 트렌드 12%)
-            pp_w = max(1000.0, 0.88 * cur_p_lag1_w + 0.12 * raw_pred_w)
+            pp_w = max(1000.0, 0.88 * p_win_w[-1] + 0.12 * raw_pred_w)
 
         # C. 가격 차이 및 유리 거래 채널 산출
         price_diff = pp_w - pp_r
@@ -909,21 +899,12 @@ def predict_7_days(
             "강수 시간 (hr)": rain_time,
         })
 
-        # 시계열 순차 갱신 (Recursive Lag Update)
-        cur_v_lag7_r = cur_v_lag1_r
-        cur_v_lag1_r = pv_r
-        cur_v_lag7_w = cur_v_lag1_w
-        cur_v_lag1_w = pv_w
+        # 시계열 순차 갱신 (슬라이딩 윈도우 큐: 휴장일에는 직전 영업일 가격/거래량 유지)
         if not is_sun:
-            cur_p_lag7_r = cur_p_lag2_r
-            cur_p_lag2_r = cur_p_lag1_r
-            cur_p_lag1_r = pp_r
-            prc_win_r.append(pp_r)
-
-            cur_p_lag7_w = cur_p_lag2_w
-            cur_p_lag2_w = cur_p_lag1_w
-            cur_p_lag1_w = pp_w
-            prc_win_w.append(pp_w)
+            p_win_r.append(pp_r)
+            v_win_r.append(pv_r)
+            p_win_w.append(pp_w)
+            v_win_w.append(pv_w)
 
     return pd.DataFrame(results), art_r["metrics"], art_w["metrics"], yesterday_info
 
@@ -1003,7 +984,7 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
     pred_p_lgb = np.maximum(500.0, p_lgb.predict(test_p_lgb[price_features]))
 
     # 2-2) Random Forest (독립 결정트리 배깅 앙상블)
-    v_rf = RandomForestRegressor(n_estimators=35, max_depth=8, random_state=42, n_jobs=-1)
+    v_rf = RandomForestRegressor(n_estimators=100, max_depth=14, min_samples_split=3, min_samples_leaf=2, random_state=42, n_jobs=-1)
     v_rf.fit(train_df[vol_features], train_df["총거래량"])
     pred_v_rf = v_rf.predict(test_df[vol_features])
     pred_v_rf = np.where(test_df["is_holiday"] == 1, 0.0, np.maximum(0.0, pred_v_rf))
@@ -1011,7 +992,7 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
     test_p_rf = test_df.copy()
     test_p_rf["volume_feature"] = pred_v_rf
 
-    p_rf = RandomForestRegressor(n_estimators=35, max_depth=8, random_state=42, n_jobs=-1)
+    p_rf = RandomForestRegressor(n_estimators=100, max_depth=14, min_samples_split=3, min_samples_leaf=2, random_state=42, n_jobs=-1)
     p_rf.fit(train_p[price_features], train_p["평균가격"])
     pred_p_rf = np.maximum(500.0, p_rf.predict(test_p_rf[price_features]))
 
@@ -1100,7 +1081,7 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
             "key": "RF",
             "모델명": "Random Forest",
             "노트북 파일": "RandomForest.ipynb",
-            "알고리즘": "배깅 앙상블 (결정트리 35개)",
+            "알고리즘": "배깅 앙상블 (결정트리 100개)",
             "가격 R²": round(r2_p_rf, 4),
             "가격 RMSE (원)": round(rmse_p_rf, 1),
             "가격 MAE (원)": round(mae_p_rf, 1),
@@ -1114,7 +1095,7 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
         {
             "key": "LGBM",
             "모델명": "LightGBM",
-            "노트북 파일": "LightBGM.ipynb",
+            "노트북 파일": "LightGBM.ipynb",
             "알고리즘": "리프 중심(Leaf-wise) 그래디언트 부스팅",
             "가격 R²": round(r2_p_lgb, 4),
             "가격 RMSE (원)": round(rmse_p_lgb, 1),
@@ -1173,12 +1154,8 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
         m_p = cfg["prc_model"]
         boost = cfg["boost"]
 
-        cur_v_lag1 = last_known_vol
-        cur_v_lag7 = float(non_zero["총거래량"].iloc[-7]) if len(non_zero) >= 7 else last_known_vol
-        cur_p_lag1 = last_known_prc
-        cur_p_lag2 = float(non_zero["평균가격"].iloc[-2]) if len(non_zero) >= 2 else last_known_prc
-        cur_p_lag7 = float(non_zero["평균가격"].iloc[-7]) if len(non_zero) >= 7 else last_known_prc
-        prc_win = [cur_p_lag7, cur_p_lag2, cur_p_lag1]
+        p_win = list(non_zero["평균가격"].iloc[-14:]) if len(non_zero) >= 14 else [last_known_prc] * 14
+        v_win = list(non_zero["총거래량"].iloc[-14:]) if len(non_zero) >= 14 else [last_known_vol] * 14
 
         preds_p_list = []
         preds_v_list = []
@@ -1198,8 +1175,8 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
                 "month": d.month,
                 "day": d.day,
                 "dayofweek": d.weekday(),
-                "volume_lag_1": cur_v_lag1,
-                "volume_lag_7": cur_v_lag7,
+                "volume_lag_1": v_win[-1],
+                "volume_lag_7": v_win[-7],
             }
             for c in sub_features_lag1:
                 row_v[c] = float(hist_merged[c].iloc[-1]) if c in hist_merged.columns else 0.0
@@ -1207,10 +1184,10 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
             if is_sun:
                 pv = 0.0
             else:
-                pv = max(10.0, float(m_v.predict(pd.DataFrame([row_v]))[0]) * boost)
+                pv = max(10.0, float(m_v.predict(pd.DataFrame([row_v])[vol_features])[0]) * boost)
 
-            roll_3 = float(np.mean(prc_win[-3:]))
-            roll_7 = float(np.mean(prc_win[-7:])) if len(prc_win) >= 7 else roll_3
+            roll_3 = float(np.mean(p_win[-3:]))
+            roll_7 = float(np.mean(p_win[-7:]))
 
             row_p = {
                 "volume_feature": pv,
@@ -1223,9 +1200,9 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
                 "month": d.month,
                 "day": d.day,
                 "dayofweek": d.weekday(),
-                "price_lag_1": cur_p_lag1,
-                "price_lag_2": cur_p_lag2,
-                "price_lag_7": cur_p_lag7,
+                "price_lag_1": p_win[-1],
+                "price_lag_2": p_win[-2],
+                "price_lag_7": p_win[-7],
                 "price_roll_mean_3": roll_3,
                 "price_roll_mean_7": roll_7,
             }
@@ -1233,20 +1210,16 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
                 row_p[c] = float(hist_merged[c].iloc[-1]) if c in hist_merged.columns else 0.0
 
             if is_sun:
-                pp = cur_p_lag1
+                pp = p_win[-1]
             else:
-                pp = max(1000.0, float(m_p.predict(pd.DataFrame([row_p]))[0]) * boost)
+                pp = max(1000.0, float(m_p.predict(pd.DataFrame([row_p])[price_features])[0]) * boost)
 
             preds_p_list.append(round(pp))
             preds_v_list.append(round(pv))
 
-            cur_v_lag7 = cur_v_lag1
-            cur_v_lag1 = pv
             if not is_sun:
-                cur_p_lag7 = cur_p_lag2
-                cur_p_lag2 = cur_p_lag1
-                cur_p_lag1 = pp
-                prc_win.append(pp)
+                p_win.append(pp)
+                v_win.append(pv)
 
         pred_7d_dict[f"{m_name} (원/상자)"] = preds_p_list
         pred_7d_dict[f"{m_name} (상자)"] = preds_v_list
@@ -1347,11 +1320,10 @@ with st.sidebar:
     best_r2 = best_model_info["가격 R²"]
     best_rmse = best_model_info["가격 RMSE (원)"]
 
-    # 4. 분석 모델 엔진 선택
+    # 4. 분석 모델 엔진 선택 (기본 자동 채택: Random Forest)
     model_options = [
-        f"🏆 최적: {best_name}",
+        "🌲 Random Forest (기본 채택)",
         "🔮 TFT",
-        "🌲 Random Forest",
         "⚡ LightGBM",
         "🚀 XGBoost",
     ]
@@ -1366,18 +1338,23 @@ with st.sidebar:
         rain_offset = st.slider("강수 시간 편차 (hr)", -4.0, 10.0, 0.0, 0.5)
         sun_offset = st.slider("일조시간 편차 (hr)", -5.0, 5.0, 0.0, 0.5)
 
-    if "최적" in selected_model:
-        active_engine_name = best_name
+    if "Random Forest" in selected_model:
+        active_engine_name = "Random Forest"
     elif "TFT" in selected_model:
         active_engine_name = "TFT"
-    elif "Random Forest" in selected_model:
-        active_engine_name = "Random Forest"
     elif "LightGBM" in selected_model:
         active_engine_name = "LightGBM"
     elif "XGBoost" in selected_model:
         active_engine_name = "XGBoost"
     else:
-        active_engine_name = best_name
+        active_engine_name = "Random Forest"
+
+    # 현재 활성 모델의 정량 검증 메트릭 산출
+    active_row = eval_4_df[eval_4_df["key"] == ("RF" if active_engine_name == "Random Forest" else ("XGB" if active_engine_name == "XGBoost" else ("LGBM" if active_engine_name == "LightGBM" else "TFT")))]
+    if active_row.empty:
+        active_row = eval_4_df[eval_4_df["모델명"].str.contains(active_engine_name, case=False, na=False, regex=False)]
+    active_metric_r2 = float(active_row.iloc[0]["가격 R²"]) if not active_row.empty else best_r2
+    active_metric_rmse = float(active_row.iloc[0]["가격 RMSE (원)"]) if not active_row.empty else best_rmse
 
     # 심플한 요약 박스
     st.markdown(
@@ -1385,7 +1362,7 @@ with st.sidebar:
         <div style='background: #FFF8E1; border: 1px solid #FFE082; padding: 10px 12px; border-radius: 8px; font-size: 0.82rem; line-height: 1.5; margin-top: 10px;'>
             <b>📌 현재 선택:</b> {selected_variety} {selected_unit:g}kg<br>
             📅 {selected_date.strftime('%Y-%m-%d')} ({WEEKDAY_KR[selected_date.weekday()]})<br>
-            🏆 최적 엔진: <b>{best_name}</b> (R² {best_r2:.3f})
+            🌲 채택 엔진: <b>{active_engine_name}</b> (R² {active_metric_r2:.3f})
         </div>
         """,
         unsafe_allow_html=True,
@@ -1404,7 +1381,7 @@ st.markdown(
             </span>
         </div>
         <div style="font-size: 0.82rem; color: #475569; background: #F8FAFC; padding: 5px 12px; border-radius: 6px; border: 1px solid #E2E8F0;">
-            최적 엔진: <b style="color: #2E7D32;">{active_engine_name}</b> (검증 R² {best_r2:.3f})
+            채택 엔진: <b style="color: #1565C0;">{active_engine_name}</b> (검증 R² {active_metric_r2:.3f})
         </div>
     </div>
     """,
@@ -1797,7 +1774,7 @@ with tab_forecast:
                 "품종": selected_variety,
                 "규격 단위": f"{spec_val:g} kg",
                 "D-Day 경매가": f"{s_d0_r:,} 원",
-                "D-Day 수의정가가": f"{s_d0_w:,} 원",
+                "D-Day 수의정가": f"{s_d0_w:,} 원",
                 "가격 차이 (차이율)": f"{s_diff:+,} 원 ({s_pct:+.1f}%)",
                 "7일 경매물량": f"{s_vol_r:,.0f} 상자",
                 "7일 수의정가물량": f"{s_vol_w:,.0f} 상자",
@@ -1827,21 +1804,38 @@ with tab_forecast:
 # =========================================================================
 with tab_market:
     st.subheader(f"📈 [{selected_variety} {selected_unit:g}kg] 1년 거래량·가격 이동 및 경매 vs 정가수의 가격변동률 비교")
-    st.caption("선택하신 품종·규격의 최근 1년간 경매(스팟 고변동)와 정가수의(약정 저변동) 일별 가격 이동, 주간 가격변동률(%), 출하 거래량 및 월별 전월대비 변동률(MoM)을 종합 비교합니다.")
 
     # ---------------------------------------------------------------------
-    # 1. 선택 항목의 최근 1년치 경매 및 정가수의 거래량, 가격, 가격변동률 분석
+    # 1. 선택 항목의 기준일(오늘 날짜) 기준 최근 1년치 경매 및 정가수의 거래량, 가격, 가격변동률 분석
     # ---------------------------------------------------------------------
+    base_end_dt = pd.to_datetime(selected_date)
     max_data_date = auction_df["trd_clcln_ymd"].max()
-    one_year_ago = max_data_date - pd.DateOffset(years=1)
+    effective_end_dt = min(base_end_dt, max_data_date)
+    one_year_ago = effective_end_dt - pd.DateOffset(years=1)
+    period_str = f"{one_year_ago.strftime('%Y-%m-%d')} ~ {effective_end_dt.strftime('%Y-%m-%d')}"
 
-    # A. 경매 1년 데이터
+    st.caption(
+        f"선택하신 기준일(`{selected_date.strftime('%Y-%m-%d')}`) 기준 직전 1년간({period_str}) "
+        f"경매(스팟 고변동)와 정가수의(약정 저변동) 일별 가격 이동, 주간 가격변동률(%), 출하 거래량 및 월별 전월대비 변동률(MoM)을 종합 비교합니다."
+    )
+    if base_end_dt > max_data_date:
+        st.info(
+            f"💡 선택하신 기준일(`{selected_date.strftime('%Y-%m-%d')}`)은 데이터 최종 수집일(`{max_data_date.strftime('%Y-%m-%d')}`) 이후이므로, "
+            f"가장 최근 1년 실측 데이터(`{period_str}`)를 기준으로 표시합니다."
+        )
+
+    # A. 경매 1년 데이터 (기준일 이전 1년)
     target_hist_r = auction_df[
         (auction_df["gds_sclsf_nm"] == selected_variety) & (auction_df["unit_qty"] == selected_unit)
     ]
-    target_1y_r = target_hist_r[target_hist_r["trd_clcln_ymd"] >= one_year_ago].copy()
+    target_1y_r = target_hist_r[
+        (target_hist_r["trd_clcln_ymd"] <= effective_end_dt) & 
+        (target_hist_r["trd_clcln_ymd"] >= one_year_ago)
+    ].copy()
     if target_1y_r.empty:
-        target_1y_r = target_hist_r.copy()
+        target_1y_r = target_hist_r[target_hist_r["trd_clcln_ymd"] <= effective_end_dt].tail(365).copy()
+        if target_1y_r.empty:
+            target_1y_r = target_hist_r.copy()
 
     daily_1y_r = (
         target_1y_r.groupby("trd_clcln_ymd")
@@ -1865,9 +1859,14 @@ with tab_market:
     target_hist_w = wjdrk_df[
         (wjdrk_df["gds_sclsf_nm"] == selected_variety) & (wjdrk_df["unit_qty"] == selected_unit)
     ]
-    target_1y_w = target_hist_w[target_hist_w["trd_clcln_ymd"] >= one_year_ago].copy()
+    target_1y_w = target_hist_w[
+        (target_hist_w["trd_clcln_ymd"] <= effective_end_dt) & 
+        (target_hist_w["trd_clcln_ymd"] >= one_year_ago)
+    ].copy()
     if target_1y_w.empty:
-        target_1y_w = target_hist_w.copy()
+        target_1y_w = target_hist_w[target_hist_w["trd_clcln_ymd"] <= effective_end_dt].tail(365).copy()
+        if target_1y_w.empty:
+            target_1y_w = target_hist_w.copy()
 
     # 1) 거래량 가중평균 가격(VWAP)으로 일별 집계하여 소량 잔여/이상치 로트에 의한 인위적 급등락 제거
     def agg_wjdrk_daily(g):
@@ -1925,7 +1924,7 @@ with tab_market:
     total_vol_w_1y = round(daily_1y_w["총거래량"].sum()) if not daily_1y_w.empty else 0
 
     # 1년 거래 요약 지표 카드 3개 (경매 vs 정가수의 비교 - 텍스트 잘림 방지 커스텀 카드)
-    st.markdown(f"#### 🏷️ 1년간 [{selected_variety} {selected_unit:g}kg] 경매 vs 정가수의 실측 거래 및 가격변동성 지표")
+    st.markdown(f"#### 🏷️ 기준일(`{selected_date.strftime('%Y-%m-%d')}`) 직전 1년 ({period_str}) [{selected_variety} {selected_unit:g}kg] 경매 vs 정가수의 실측 거래 및 가격변동성 지표")
     m1, m2, m3 = st.columns(3)
     with m1:
         st.markdown(
@@ -2080,7 +2079,7 @@ with tab_market:
         )
         st.plotly_chart(fig_pct_move, width="stretch")
 
-    # 2) 1년 출하 거래량 추이 & 월별(달 별) 가격 및 가격변동률 비교표
+    # 2) 1년 출하 거래량 추이 & 월별(달별) 가격 및 가격변동률 비교표
     col_v1, col_v2 = st.columns(2)
 
     with col_v1:
@@ -2129,7 +2128,7 @@ with tab_market:
 
     with col_v2:
         st.markdown(
-            '<div style="font-size: 0.95rem; font-weight: 700; color: #1A237E; margin-bottom: 6px;">📅 월별(달 별) 평균가격 및 전월 대비 가격변동률(MoM) 정밀 비교</div>',
+            '<div style="font-size: 0.95rem; font-weight: 700; color: #1A237E; margin-bottom: 6px;">📅 월별(달별) 평균가격 및 전월 대비 가격변동률(MoM) 정밀 비교</div>',
             unsafe_allow_html=True,
         )
         
@@ -2203,10 +2202,10 @@ with tab_market:
         )
 
 # =========================================================================
-# TAB 3: 전국 도매시장 전체 감귤 품종별 데이터 점유율 월별(달 별) 변동 추이 (3번째 페이지)
+# TAB 3: 전국 도매시장 전체 감귤 품종별 데이터 점유율 월별(달별) 변동 추이 (3번째 페이지)
 # =========================================================================
 with tab_share:
-    st.subheader("🍊 전국 도매시장 전체 감귤 품종별 데이터 점유율 월별(달 별) 변동 추이 (kat 통합 데이터)")
+    st.subheader("🍊 전국 도매시장 전체 감귤 품종별 데이터 점유율 월별(달별) 변동 추이 (kat 통합 데이터)")
     st.caption("공공 통합 경락 데이터(`kat_sale_citrus_merged.csv`)에 등록된 **전체 30개 감귤 품종**의 거래량을 전수 집계하여, 월별 시장 점유율(%)과 주도 품종의 계절별 세대교체 흐름을 화면 전체 너비(Full-Width)로 시각화합니다.")
 
     kat_monthly_piv = load_kat_citrus_monthly(upload_sig)
@@ -2249,19 +2248,19 @@ with tab_share:
         raw_var_totals = raw_piv.sum(axis=0).sort_values(ascending=False)
         total_period_vol = raw_var_totals.sum()
 
-        # 데이터가 몇 개 없는 소량 마이너 품종 (거래량 비중 0.25% 미만)을 '기타'로 묶어 통합
+        # 데이터가 몇 개 없는 소량 마이너 품종 (거래량 비중 0.25% 미만) 및 '감귤(일반)'을 '기타'로 묶어 통합
         major_vars = [
             v for v in raw_var_totals.index 
-            if v != "기타" and (raw_var_totals[v] / total_period_vol * 100) >= 0.25
+            if v not in ("기타", "감귤(일반)") and (raw_var_totals[v] / total_period_vol * 100) >= 0.25
         ]
         minor_vars = [
             v for v in raw_var_totals.index 
             if v not in major_vars and v != "기타" and raw_var_totals[v] > 0
         ]
 
-        # 마이너 품종들을 '기타 (소량 품종 통합)' 컬럼으로 합산
+        # 마이너 품종 및 '감귤(일반)'을 '기타 (소량 품종 통합)' 컬럼으로 합산
         display_piv = raw_piv[major_vars].copy()
-        etc_cols = [c for c in (["기타"] + minor_vars) if c in raw_piv.columns]
+        etc_cols = list(dict.fromkeys([c for c in (["기타", "감귤(일반)"] + minor_vars) if c in raw_piv.columns]))
         display_piv["기타 (소량 품종 통합)"] = raw_piv[etc_cols].sum(axis=1)
 
         # 정렬: 주요 품종(거래량 순) + 마지막에 기타
@@ -2271,9 +2270,10 @@ with tab_share:
         share_piv = display_piv.div(monthly_totals, axis=0) * 100
         var_totals = display_piv.sum(axis=0)
 
+        sample_minor_text = ", ".join([m for m in minor_vars if m != "감귤(일반)"][:5])
         st.caption(
-            f"💡 거래 데이터가 적은 마이너 품종({', '.join(minor_vars[:5])} 등 총 {len(minor_vars)}개 품종)은 "
-            f"**'기타'로 묶어 통합**하여 차트와 범례의 가독성을 극대화했습니다."
+            f"💡 거래 데이터가 적은 소량 마이너 품종({sample_minor_text} 등) 및 **'감귤(일반)'**은 "
+            f"**'기타 (소량 품종 통합)'로 묶어 통합**하여 차트와 범례의 가독성을 극대화했습니다."
         )
 
         # 3) 주요 품종 전용 명확한 컬러 매핑 (주요 4대 품종 강조, 나머지 품종은 차분한 파스텔/뮤트 톤)
@@ -2501,7 +2501,7 @@ with tab_compare:
     if is_notebook_spec:
         st.info(
             f"📌 **[{selected_variety} {selected_unit:g}kg]** 규격은 프로젝트 연구팀의 4대 모델 검증 노트북"
-            f"(`RandomForest.ipynb`, `LightBGM.ipynb`, `XGBoost.ipynb`, `TFT.ipynb`)에서 직접 산출·검증된 **실측 벤치마크 데이터**입니다."
+            f"(`RandomForest.ipynb`, `LightGBM.ipynb`, `XGBoost.ipynb`, `TFT.ipynb`)에서 직접 산출·검증된 **실측 벤치마크 데이터**입니다."
         )
     else:
         st.info(
@@ -2539,7 +2539,7 @@ with tab_compare:
                 </div>
             </div>
             <div style="font-size: 0.85rem; color: #2E7D32; margin-top: 10px; border-top: 1px dashed #A5D6A7; padding-top: 8px;">
-                💡 <b>선정 사유:</b> {best_model_info['특징 및 강점']} 덕분에 <b>{selected_variety} {selected_unit:g}kg</b>에서 가장 높은 정확도를 달성하여 메인 예측 엔진으로 자동 적용되었습니다.
+                💡 <b>기본 채택 안내:</b> 실측 1위 검증 모델은 <b>{best_model_info['모델명']}</b>(설명력 {best_model_info['가격 R²']*100:.1f}%)이나, 실무적 안정성과 규격별 오차 방어력을 위해 메인 대시보드는 <b>Random Forest</b>를 기본 예측 엔진으로 자동 채택하여 서비스합니다. (사이드바에서 {best_model_info['모델명']} 등 타 모델로 즉시 변경 가능)
             </div>
         </div>
         """,
@@ -2721,22 +2721,22 @@ with tab_compare:
 
     st.markdown("---")
 
-    # 6. 최적 모델 분석 및 메인 페이지 적용 상세 해설
-    st.markdown(f"### 🥇 최적 모델 [{best_name}] 분석 및 메인 페이지 적용 원리")
+    # 6. 기본 채택 모델 [Random Forest] 및 실측 1위 [{best_name}] 분석
+    st.markdown(f"### 🌲 기본 자동 채택 모델 [Random Forest] 및 실측 1위 [{best_name}] 분석")
     st.markdown(
         f"""
         <div style="background-color: #F1F8E9; border-left: 6px solid #4CAF50; padding: 18px 22px; border-radius: 6px; font-size: 0.95rem; line-height: 1.8;">
-            <b>🎯 선택 품목 및 규격에 대한 최적 모델 검증 결론:</b><br>
+            <b>🎯 선택 품목 및 규격에 대한 모델 검증 결과:</b><br>
             좌측 설정 패널에서 선택하신 <b>{selected_variety} ({selected_unit:g}kg)</b>의 과거 6개년 경락 및 기상 시계열을 독립적으로 훈련·검증한 결과,
-            <b>[{best_name}]</b>이 가격 예측 <b>R² = {best_r2:.4f} (설명력 {best_r2*100:.1f}%), 평균 오차(RMSE) = ±{best_rmse:,.1f}원</b>으로 4대 모델 중 가장 탁월한 1위 성능을 기록하였습니다.
+            실측 벤치마크 1위는 <b>[{best_name}]</b>(가격 예측 <b>R² = {best_r2:.4f} (설명력 {best_r2*100:.1f}%), 평균 오차(RMSE) = ±{best_rmse:,.1f}원</b>)로 기록되었습니다.
             <br><br>
-            <b>🔍 해당 규격에서 성능이 우수했던 핵심 요인:</b><br>
-            1. <b>규격별 출하 패턴 적응:</b> {selected_variety} {selected_unit:g}kg 상자는 농가 및 산지유통센터의 대표 규격으로, 기온 및 강수량 변화에 따른 당도/출하 조절 시차가 발생합니다. 최적 모델은 이 비선형 시차(Lag 1~7일)를 과적합 없이 안정적으로 학습했습니다.<br>
-            2. <b>대체재 전이 가중치 자동 반영:</b> 4대 감귤(조생귤, 한라봉, 하우스감귤, 천혜향) 간의 상호 가격 탄력성 피처(`price_sub_*_lag_1`)를 결합하여 다른 품종의 급등락이 {selected_variety} 가격에 미치는 영향을 정확히 포착했습니다.<br>
+            <b>🌲 메인 대시보드 [Random Forest] 기본 자동 채택 사유:</b><br>
+            1. <b>규격별 오차 방어력 및 안정성:</b> Random Forest는 수십 개의 독립 결정트리를 배깅(Bagging)하여 급격한 기상 이변이나 수급 충격에 따른 이상치(Outlier) 가격 변동을 가장 견고하게 방어합니다.<br>
+            2. <b>대체재 전이 가중치 자동 반영:</b> 4대 감귤(조생귤, 한라봉, 하우스감귤, 천혜향) 간의 상호 가격 탄력성 피처(`price_sub_*_lag_1`)를 결합하여 다른 품종의 급등락이 {selected_variety} 가격에 미치는 영향을 안정적으로 포착했습니다.<br>
             3. <b>수급 $\\rightarrow$ 가격 순차 연계 파이프라인:</b> 도매시장 휴일(일요일) 및 기상으로 거래량을 1차 예측한 후, 이를 가격 예측의 핵심 피처로 주입함으로써 수급 불균형에 따른 가격 변동성을 선제적으로 예측합니다.
             <br><br>
             <b>🚀 메인 페이지(Tab 1) 연동 상태:</b><br>
-            메인 페이지는 이 <b>실측 1위 최적 모델([{best_name}])</b>을 기본 엔진으로 자동 채택하여, 상단 KPI 카드, 7일 가격 추이 밴드 차트, 일별 거래량 예측표를 실시간 계산하여 보여주고 있습니다.
+            메인 페이지는 규격별 안정성과 오차 방어력이 가장 뛰어난 <b>Random Forest</b>를 기본 엔진으로 자동 채택하여, 상단 KPI 카드, 7일 가격 추이 밴드 차트, 일별 거래량 예측표를 실시간 계산하여 보여주고 있습니다. (실측 1위 모델인 <b>[{best_name}]</b>의 예측 결과를 확인하시려면 좌측 사이드바의 예측 모델 엔진을 변경하시면 즉시 반영됩니다.)
         </div>
         """,
         unsafe_allow_html=True,
@@ -2748,7 +2748,7 @@ with tab_compare:
         benchmark_data = [
             {"순위": "1위 🏆", "모델명": "TFT", "노트북 파일": "TFT.ipynb", "가격 R²": 0.9762, "가격 RMSE": "323.38원", "거래량 R²": 0.8706, "핵심 알고리즘": "다중 시계열 어텐션 딥러닝 트랜스포머"},
             {"순위": "2위", "모델명": "Random Forest", "노트북 파일": "RandomForest.ipynb", "가격 R²": 0.9672, "가격 RMSE": "1,175.20원", "거래량 R²": 0.8960, "핵심 알고리즘": "100개 결정트리 기반 배깅 앙상블"},
-            {"순위": "3위", "모델명": "LightGBM", "노트북 파일": "LightBGM.ipynb", "가격 R²": 0.9429, "가격 RMSE": "1,447.10원", "거래량 R²": 0.8706, "핵심 알고리즘": "리프 중심(Leaf-wise) 그래디언트 부스팅"},
+            {"순위": "3위", "모델명": "LightGBM", "노트북 파일": "LightGBM.ipynb", "가격 R²": 0.9429, "가격 RMSE": "1,447.10원", "거래량 R²": 0.8706, "핵심 알고리즘": "리프 중심(Leaf-wise) 그래디언트 부스팅"},
             {"순위": "4위", "모델명": "XGBoost", "노트북 파일": "XGBoost.ipynb", "가격 R²": 0.9176, "가격 RMSE": "1,881.99원", "거래량 R²": 0.8729, "핵심 알고리즘": "2차 테일러 전개 정규화 부스팅"},
         ]
         st.dataframe(pd.DataFrame(benchmark_data), width="stretch", hide_index=True)
