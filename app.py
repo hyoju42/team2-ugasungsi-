@@ -394,6 +394,17 @@ def load_and_preprocess_data(upload_sig: str = "default"):
     else:
         wjdrk_df = wjdrk_df.drop_duplicates().reset_index(drop=True)
 
+    # 이상치 및 반품/취소 전표 필터링 (음수 거래량, 음수 단가, 0 이하 수량 전표 원천 배제)
+    if "unit_tot_qty" in auction_df.columns and "unit_qty" in auction_df.columns:
+        auction_df = auction_df[(auction_df["unit_tot_qty"] > 0) & (auction_df["unit_qty"] > 0)].copy()
+    if "avgprc" in auction_df.columns:
+        auction_df = auction_df[auction_df["avgprc"] > 0].copy()
+
+    if "unit_tot_qty" in wjdrk_df.columns and "unit_qty" in wjdrk_df.columns:
+        wjdrk_df = wjdrk_df[(wjdrk_df["unit_tot_qty"] > 0) & (wjdrk_df["unit_qty"] > 0)].copy()
+    if "avgprc" in wjdrk_df.columns:
+        wjdrk_df = wjdrk_df[wjdrk_df["avgprc"] > 0].copy()
+
     # 기상 변수 처리 (결측치 0.0 대치)
     date_col_f = "일시" if "일시" in forecast_df.columns else "trd_clcln_ymd"
     forecast_df[date_col_f] = pd.to_datetime(forecast_df[date_col_f]).dt.normalize()
@@ -419,12 +430,9 @@ def load_and_preprocess_data(upload_sig: str = "default"):
         .rename(columns={date_col_f: "trd_clcln_ymd"})
     )
 
-    # 거래량 계산 (단위총수량 / 단위수량)
-    auction_df["calculated_vol"] = auction_df["unit_tot_qty"] / auction_df["unit_qty"].replace(0, 1)
-    auction_df["calculated_vol"] = auction_df["calculated_vol"].fillna(0.0)
-
-    wjdrk_df["calculated_vol"] = wjdrk_df["unit_tot_qty"] / wjdrk_df["unit_qty"].replace(0, 1)
-    wjdrk_df["calculated_vol"] = wjdrk_df["calculated_vol"].fillna(0.0)
+    # 거래량 계산 (단위총수량 / 단위수량) - 0.0 이상 클리핑
+    auction_df["calculated_vol"] = (auction_df["unit_tot_qty"] / auction_df["unit_qty"].replace(0, 1)).fillna(0.0).clip(lower=0.0)
+    wjdrk_df["calculated_vol"] = (wjdrk_df["unit_tot_qty"] / wjdrk_df["unit_qty"].replace(0, 1)).fillna(0.0).clip(lower=0.0)
 
     min_date = auction_df["trd_clcln_ymd"].min()
     max_date = auction_df["trd_clcln_ymd"].max()
@@ -497,9 +505,9 @@ def load_kat_citrus_monthly(upload_sig: str = "default"):
     use_cols = ["trd_clcln_ymd", "gds_sclsf_nm", "unit_tot_qty", "unit_qty"]
     df = pd.read_csv(kat_path, usecols=use_cols, encoding="utf-8")
     df = df.dropna(subset=["gds_sclsf_nm", "trd_clcln_ymd"])
+    df = df[(df["unit_tot_qty"] > 0) & (df["unit_qty"] > 0)]
     df["trd_clcln_ymd"] = pd.to_datetime(df["trd_clcln_ymd"]).dt.normalize()
-    df["calculated_vol"] = df["unit_tot_qty"] / df["unit_qty"].replace(0, 1)
-    df["calculated_vol"] = df["calculated_vol"].fillna(0.0)
+    df["calculated_vol"] = (df["unit_tot_qty"] / df["unit_qty"].replace(0, 1)).fillna(0.0).clip(lower=0.0)
     df["year_month"] = df["trd_clcln_ymd"].dt.strftime("%Y-%m")
 
     monthly_vol_piv = (
@@ -533,7 +541,14 @@ def train_variety_spec_models(variety: str, unit_qty: float, model_type: str = "
     # 1) 일별 전국 통합 시계열 집계 (초고속 연산 최적화: 0.05초)
     daily = (
         grp_df.groupby("trd_clcln_ymd")
-        .agg(총거래량=("calculated_vol", "sum"), 평균가격=("avgprc", "mean"))
+        .agg(
+            총거래량=("calculated_vol", "sum"),
+            평균가격=("avgprc", "mean"),
+            최저가격=("lwprc", lambda s: float(s[s > 0].min()) if (s > 0).any() else (float(s.min()) if len(s) > 0 else 0.0)),
+            최고가격=("hgprc", lambda s: float(s.max()) if len(s) > 0 else 0.0),
+            주요최저가=("lwprc", lambda s: float(s[s > 0].quantile(0.10)) if (s > 0).any() else (float(s.quantile(0.10)) if len(s) > 0 else 0.0)),
+            주요최고가=("hgprc", lambda s: float(s.quantile(0.90)) if len(s) > 0 else 0.0),
+        )
         .reset_index()
     )
 
@@ -544,8 +559,12 @@ def train_variety_spec_models(variety: str, unit_qty: float, model_type: str = "
 
     # 시장 휴일 플래그 (거래량이 없는 날 = 휴일)
     merged["is_holiday"] = merged["총거래량"].isna().astype(int)
-    merged["총거래량"] = merged["총거래량"].fillna(0.0)
+    merged["총거래량"] = merged["총거래량"].fillna(0.0).clip(lower=0.0)
     merged["평균가격"] = merged["평균가격"].ffill().bfill()
+    merged["최저가격"] = merged["최저가격"].ffill().bfill()
+    merged["최고가격"] = merged["최고가격"].ffill().bfill()
+    merged["주요최저가"] = merged["주요최저가"].ffill().bfill()
+    merged["주요최고가"] = merged["주요최고가"].ffill().bfill()
     merged["year"] = merged["trd_clcln_ymd"].dt.year
     merged["month"] = merged["trd_clcln_ymd"].dt.month
     merged["day"] = merged["trd_clcln_ymd"].dt.day
@@ -590,9 +609,9 @@ def train_variety_spec_models(variety: str, unit_qty: float, model_type: str = "
         m_vol = lgb.LGBMRegressor(n_estimators=80, learning_rate=0.08, verbose=-1, random_state=42, n_jobs=-1)
         m_prc = lgb.LGBMRegressor(n_estimators=80, learning_rate=0.08, verbose=-1, random_state=42, n_jobs=-1)
 
-    # 1단계: 거래량 모델 학습
+    # 1단계: 거래량 모델 학습 (음수 거래량 예측 원천 방지)
     m_vol.fit(train_df[vol_features], train_df["총거래량"])
-    test_df["pred_vol"] = m_vol.predict(test_df[vol_features])
+    test_df["pred_vol"] = np.maximum(0.0, m_vol.predict(test_df[vol_features]))
     test_df.loc[test_df["is_holiday"] == 1, "pred_vol"] = 0.0
 
     # 2단계: 가격 모델 학습 (예측된 거래량을 피처로 결합)
@@ -643,6 +662,317 @@ def train_variety_spec_models(variety: str, unit_qty: float, model_type: str = "
 
 
 # -----------------------------------------------------------------------------
+# 4. 전국 도매시장 통합 연속 시계열 타임라인 생성 엔진 (일자별 불변성 및 연속성 보장)
+# -----------------------------------------------------------------------------
+@st.cache_data(show_spinner=False)
+def get_continuous_market_timeline(
+    variety: str,
+    unit_qty: float,
+    model_type: str,
+    upload_sig: str = "default",
+    temp_offset: float = 0.0,
+    sun_offset: float = 0.0,
+    rain_offset: float = 0.0,
+    end_date_str: str = "2026-12-31",
+):
+    if upload_sig == "default":
+        upload_sig = get_upload_sig()
+
+    # 경매(rudao) 및 수의정가(wjdrk) 학습 모델 및 이력 데이터 로드
+    art_r = train_variety_spec_models(variety, unit_qty, model_type, channel="경매", upload_sig=upload_sig)
+    art_w = train_variety_spec_models(variety, unit_qty, model_type, channel="수의정가", upload_sig=upload_sig)
+
+    merged_r = art_r["merged_history"].copy()
+    merged_w = art_w["merged_history"].copy()
+
+    date_col_r = "trd_clcln_ymd" if "trd_clcln_ymd" in merged_r.columns else "date"
+    date_col_w = "trd_clcln_ymd" if "trd_clcln_ymd" in merged_w.columns else "date"
+
+    merged_r["_dt"] = pd.to_datetime(merged_r[date_col_r]).dt.date
+    merged_w["_dt"] = pd.to_datetime(merged_w[date_col_w]).dt.date
+
+    non_zero_r = merged_r[merged_r["is_holiday"] == 0]
+    max_data_dt = non_zero_r["_dt"].max()
+
+    target_end_date = max(datetime.date(2026, 12, 31), pd.to_datetime(end_date_str).date())
+
+    weather_by_md = merged_r.groupby(["month", "day"])[["평균기온(°C)", "강수 계속시간(hr)", "10분 최다 강수량(mm)"]].mean()
+    weather_overall = merged_r[["평균기온(°C)", "강수 계속시간(hr)", "10분 최다 강수량(mm)"]].mean()
+
+    # 실제 데이터 매핑 사전
+    hist_r_map = {row["_dt"]: row for _, row in merged_r.iterrows()}
+    hist_w_map = {row["_dt"]: row for _, row in merged_w.iterrows()}
+
+    # 최근 14 영업일의 품위별 가격 스프레드 비율 계산
+    recent_active = non_zero_r.tail(14)
+    if not recent_active.empty and "최저가격" in recent_active.columns and "최고가격" in recent_active.columns:
+        valid_lw = recent_active[recent_active["최저가격"] > 0]
+        lw_ratios = ((valid_lw["평균가격"] - valid_lw["최저가격"]) / valid_lw["평균가격"]).clip(0.3, 0.9)
+        hg_ratios = ((valid_lw["최고가격"] - valid_lw["평균가격"]) / valid_lw["평균가격"]).clip(0.8, 5.0)
+        core_lw_r = ((valid_lw["평균가격"] - valid_lw["주요최저가"]) / valid_lw["평균가격"]).clip(0.15, 0.5) if "주요최저가" in valid_lw.columns else pd.Series([0.3])
+        core_hg_r = ((valid_lw["주요최고가"] - valid_lw["평균가격"]) / valid_lw["평균가격"]).clip(0.2, 0.8) if "주요최고가" in valid_lw.columns else pd.Series([0.4])
+        base_lw_ratio = float(lw_ratios.mean()) if not lw_ratios.empty else 0.75
+        base_hg_ratio = float(hg_ratios.mean()) if not hg_ratios.empty else 3.0
+        base_core_lw = float(core_lw_r.mean()) if not core_lw_r.empty else 0.30
+        base_core_hg = float(core_hg_r.mean()) if not core_hg_r.empty else 0.40
+    else:
+        base_lw_ratio, base_hg_ratio, base_core_lw, base_core_hg = 0.75, 3.0, 0.30, 0.40
+
+    tft_boost = 1.025 if "TFT" in model_type else 1.0
+
+    timeline = {}
+
+    # 1단계: 실측 데이터 구간 (min_date ~ max_data_dt)
+    min_data_dt = merged_r["_dt"].min()
+    curr = min_data_dt
+    last_known_p_r = float(non_zero_r["평균가격"].iloc[0]) if not non_zero_r.empty else 10000.0
+    last_known_p_w = 12000.0
+
+    while curr <= max_data_dt:
+        is_sun = 1 if is_market_closed(curr) else 0
+        r_row = hist_r_map.get(curr)
+        w_row = hist_w_map.get(curr)
+
+        has_r = r_row is not None and r_row["is_holiday"] == 0 and pd.notna(r_row["평균가격"]) and float(r_row["평균가격"]) > 0
+        has_w = w_row is not None and w_row["is_holiday"] == 0 and pd.notna(w_row["평균가격"]) and float(w_row["평균가격"]) > 0
+
+        if is_sun or not has_r:
+            status = "시장 휴장"
+            p_r = last_known_p_r
+            v_r = 0.0
+            low_r = p_r * 0.25
+            high_r = p_r * 3.2
+            core_low_r = p_r * 0.70
+            core_high_r = p_r * 1.35
+            is_actual = False
+        else:
+            status = "실측 완료"
+            p_r = float(r_row["평균가격"])
+            v_r = max(0.0, float(r_row["총거래량"]))
+            low_r = float(r_row["최저가격"]) if ("최저가격" in r_row and pd.notna(r_row["최저가격"]) and float(r_row["최저가격"]) > 0) else p_r * 0.3
+            high_r = float(r_row["최고가격"]) if ("최고가격" in r_row and pd.notna(r_row["최고가격"]) and float(r_row["최고가격"]) > 0) else p_r * 3.0
+            core_low_r = float(r_row["주요최저가"]) if ("주요최저가" in r_row and pd.notna(r_row["주요최저가"]) and float(r_row["주요최저가"]) > 0) else p_r * 0.75
+            core_high_r = float(r_row["주요최고가"]) if ("주요최고가" in r_row and pd.notna(r_row["주요최고가"]) and float(r_row["주요최고가"]) > 0) else p_r * 1.35
+            is_actual = True
+            last_known_p_r = p_r
+
+        if is_sun or not has_w:
+            p_w = last_known_p_w
+            v_w = 0.0
+        else:
+            p_w = float(w_row["평균가격"])
+            v_w = max(0.0, float(w_row["총거래량"]))
+            last_known_p_w = p_w
+
+        md_key = (curr.month, curr.day)
+        w_vals = weather_by_md.loc[md_key].to_dict() if md_key in weather_by_md.index else weather_overall.to_dict()
+
+        timeline[curr.strftime("%Y-%m-%d")] = {
+            "date": curr,
+            "date_str": curr.strftime("%Y-%m-%d"),
+            "weekday_str": f"{WEEKDAY_KR[curr.weekday()]}요일",
+            "is_sun": is_sun,
+            "status": status,
+            "p_r": p_r,
+            "v_r": v_r,
+            "low_r": low_r,
+            "high_r": high_r,
+            "core_low_r": core_low_r,
+            "core_high_r": core_high_r,
+            "is_actual": is_actual,
+            "p_w": p_w,
+            "v_w": v_w,
+            "avg_temp": round(w_vals["평균기온(°C)"] + temp_offset, 1),
+            "rain_time": max(0.0, round(w_vals["강수 계속시간(hr)"] + rain_offset, 1)),
+        }
+        curr += datetime.timedelta(days=1)
+
+    # 2단계: 순차 AI 시계열 예측 구간 (max_data_dt + 1 ~ target_end_date)
+    p_win_r = list(non_zero_r["평균가격"].iloc[-14:]) if len(non_zero_r) >= 14 else [last_known_p_r] * 14
+    v_win_r = list(non_zero_r["총거래량"].iloc[-14:]) if len(non_zero_r) >= 14 else [500.0] * 14
+    non_zero_w = merged_w[merged_w["is_holiday"] == 0]
+    p_win_w = list(non_zero_w["평균가격"].iloc[-14:]) if len(non_zero_w) >= 14 else [last_known_p_w] * 14
+    v_win_w = list(non_zero_w["총거래량"].iloc[-14:]) if len(non_zero_w) >= 14 else [300.0] * 14
+
+    curr = max_data_dt + datetime.timedelta(days=1)
+    future_step = 0
+
+    while curr <= target_end_date:
+        is_sun = 1 if is_market_closed(curr) else 0
+
+        md_key = (curr.month, curr.day)
+        w_vals = weather_by_md.loc[md_key].to_dict() if md_key in weather_by_md.index else weather_overall.to_dict()
+        avg_temp = round(w_vals["평균기온(°C)"] + temp_offset, 1)
+        rain_time = max(0.0, round(w_vals["강수 계속시간(hr)"] + rain_offset, 1))
+        max_rain = max(0.0, round(w_vals["10분 최다 강수량(mm)"] + (rain_offset * 0.5), 1))
+        sun_val = max(0.0, round(float(w_vals.get("일조시간(hr)", 5.5)) + sun_offset, 1))
+
+        if is_sun:
+            pp_r = p_win_r[-1]
+            pv_r = 0.0
+            price_low = pp_r * 0.25
+            price_high = pp_r * 3.2
+            core_low = pp_r * 0.70
+            core_high = pp_r * 1.35
+            pp_w = p_win_w[-1]
+            pv_w = 0.0
+            status = "시장 휴장"
+        else:
+            status = "정상 개장"
+            # 경매 예측 1단계: 거래량
+            row_v_r = {
+                "평균기온(°C)": avg_temp,
+                "강수 계속시간(hr)": rain_time,
+                "10분 최다 강수량(mm)": max_rain,
+                "일조시간(hr)": sun_val,
+                "is_holiday": 0,
+                "year": curr.year,
+                "month": curr.month,
+                "day": curr.day,
+                "dayofweek": curr.weekday(),
+                "volume_lag_1": v_win_r[-1],
+                "volume_lag_7": v_win_r[-7],
+            }
+            for c in art_r["sub_lag_cols"]:
+                row_v_r[c] = float(merged_r[c].iloc[-1]) if c in merged_r.columns else 0.0
+            pv_r = max(10.0, float(art_r["model_vol"].predict(pd.DataFrame([row_v_r])[art_r["vol_features"]])[0]) * tft_boost)
+
+            # 경매 예측 2단계: 가격
+            row_p_r = {
+                "volume_feature": pv_r,
+                "평균기온(°C)": avg_temp,
+                "강수 계속시간(hr)": rain_time,
+                "10분 최다 강수량(mm)": max_rain,
+                "일조시간(hr)": sun_val,
+                "is_holiday": 0,
+                "year": curr.year,
+                "month": curr.month,
+                "day": curr.day,
+                "dayofweek": curr.weekday(),
+                "price_lag_1": p_win_r[-1],
+                "price_lag_2": p_win_r[-2],
+                "price_lag_7": p_win_r[-7],
+                "price_roll_mean_3": float(np.mean(p_win_r[-3:])),
+                "price_roll_mean_7": float(np.mean(p_win_r[-7:])),
+            }
+            for c in art_r["sub_lag_cols"]:
+                row_p_r[c] = float(merged_r[c].iloc[-1]) if c in merged_r.columns else 0.0
+            pp_r = max(1000.0, float(art_r["model_prc"].predict(pd.DataFrame([row_p_r])[art_r["price_features"]])[0]) * tft_boost)
+
+            # 수의정가 예측 1단계: 거래량
+            row_v_w = {
+                "평균기온(°C)": avg_temp,
+                "강수 계속시간(hr)": rain_time,
+                "10분 최다 강수량(mm)": max_rain,
+                "일조시간(hr)": sun_val,
+                "is_holiday": 0,
+                "year": curr.year,
+                "month": curr.month,
+                "day": curr.day,
+                "dayofweek": curr.weekday(),
+                "volume_lag_1": v_win_w[-1],
+                "volume_lag_7": v_win_w[-7],
+            }
+            for c in art_w["sub_lag_cols"]:
+                row_v_w[c] = float(merged_w[c].iloc[-1]) if c in merged_w.columns else 0.0
+            pv_w = max(5.0, float(art_w["model_vol"].predict(pd.DataFrame([row_v_w])[art_w["vol_features"]])[0]) * tft_boost)
+
+            # 수의정가 예측 2단계: 가격
+            row_p_w = {
+                "volume_feature": pv_w,
+                "평균기온(°C)": avg_temp,
+                "강수 계속시간(hr)": rain_time,
+                "10분 최다 강수량(mm)": max_rain,
+                "일조시간(hr)": sun_val,
+                "is_holiday": 0,
+                "year": curr.year,
+                "month": curr.month,
+                "day": curr.day,
+                "dayofweek": curr.weekday(),
+                "price_lag_1": p_win_w[-1],
+                "price_lag_2": p_win_w[-2],
+                "price_lag_7": p_win_w[-7],
+                "price_roll_mean_3": float(np.mean(p_win_w[-3:])),
+                "price_roll_mean_7": float(np.mean(p_win_w[-7:])),
+            }
+            for c in art_w["sub_lag_cols"]:
+                row_p_w[c] = float(merged_w[c].iloc[-1]) if c in merged_w.columns else 0.0
+            raw_pred_w = float(art_w["model_prc"].predict(pd.DataFrame([row_p_w])[art_w["price_features"]])[0]) * tft_boost
+            pp_w = max(1000.0, 0.30 * p_win_w[-1] + 0.70 * raw_pred_w)
+
+            # 품위별 가격 신뢰구간 동적 산정
+            dow = curr.weekday()
+            dow_hg_adj = {0: 1.08, 1: 1.05, 2: 0.98, 3: 0.96, 4: 1.02, 5: 0.92, 6: 1.0}.get(dow, 1.0)
+            dow_lw_adj = {0: 1.03, 1: 1.01, 2: 0.97, 3: 0.98, 4: 1.02, 5: 0.95, 6: 1.0}.get(dow, 1.0)
+            horizon_expand = 1.0 + (0.015 * min(future_step, 14))
+
+            price_low = max(500.0, pp_r * (1.0 - min(0.88, base_lw_ratio * dow_lw_adj * horizon_expand)))
+            price_high = pp_r * (1.0 + max(1.2, base_hg_ratio * dow_hg_adj * horizon_expand))
+            core_low = max(500.0, pp_r * (1.0 - min(0.50, base_core_lw * dow_lw_adj * horizon_expand)))
+            core_high = pp_r * (1.0 + max(0.25, base_core_hg * dow_hg_adj * horizon_expand))
+
+            p_win_r.append(pp_r)
+            v_win_r.append(pv_r)
+            p_win_w.append(pp_w)
+            v_win_w.append(pv_w)
+            future_step += 1
+
+        timeline[curr.strftime("%Y-%m-%d")] = {
+            "date": curr,
+            "date_str": curr.strftime("%Y-%m-%d"),
+            "weekday_str": f"{WEEKDAY_KR[curr.weekday()]}요일",
+            "is_sun": is_sun,
+            "status": status,
+            "p_r": pp_r,
+            "v_r": pv_r,
+            "low_r": price_low,
+            "high_r": price_high,
+            "core_low_r": core_low,
+            "core_high_r": core_high,
+            "is_actual": False,
+            "p_w": pp_w,
+            "v_w": pv_w,
+            "avg_temp": avg_temp,
+            "rain_time": rain_time,
+        }
+        curr += datetime.timedelta(days=1)
+
+    # 3단계: 전일대비 변동(chg_str) 및 직전 개장일(prev_open_date) 결정적 연산
+    sorted_keys = sorted(timeline.keys())
+    last_open_date_str = None
+    last_open_p_r = None
+
+    for k in sorted_keys:
+        d_item = timeline[k]
+        if d_item["is_sun"] == 1:
+            d_item["prev_open_date"] = last_open_date_str
+            d_item["prev_open_p_r"] = last_open_p_r
+            d_item["diff_prev_p_r"] = 0.0
+            d_item["pct_prev_p_r"] = 0.0
+            d_item["chg_str"] = "휴장 (-)"
+        else:
+            if last_open_date_str is not None and last_open_p_r is not None:
+                diff = d_item["p_r"] - last_open_p_r
+                pct = (diff / last_open_p_r * 100) if last_open_p_r > 0 else 0.0
+                d_item["prev_open_date"] = last_open_date_str
+                d_item["prev_open_p_r"] = last_open_p_r
+                d_item["diff_prev_p_r"] = diff
+                d_item["pct_prev_p_r"] = pct
+                d_item["chg_str"] = f"{diff:+,.0f}원 ({pct:+.1f}%)"
+            else:
+                d_item["prev_open_date"] = None
+                d_item["prev_open_p_r"] = d_item["p_r"]
+                d_item["diff_prev_p_r"] = 0.0
+                d_item["pct_prev_p_r"] = 0.0
+                d_item["chg_str"] = "-"
+
+            last_open_date_str = k
+            last_open_p_r = d_item["p_r"]
+
+    return timeline
+
+
+# -----------------------------------------------------------------------------
 # 4. 7일 예측 생성 엔진 (경매와 수의정가 동시 예측 및 격차 비교)
 # -----------------------------------------------------------------------------
 def predict_7_days(
@@ -657,206 +987,86 @@ def predict_7_days(
 ):
     if upload_sig == "default":
         upload_sig = get_upload_sig()
-    # 1) 경매(rudao) 모델과 수의정가(wjdrk) 모델을 각각 학습/호출
-    art_r = train_variety_spec_models(variety, unit_qty, model_type, channel="경매", upload_sig=upload_sig)
-    art_w = train_variety_spec_models(variety, unit_qty, model_type, channel="수의정가", upload_sig=upload_sig)
 
-    merged_r = art_r["merged_history"]
-    merged_w = art_w["merged_history"]
+    min_end = datetime.date(2026, 12, 31)
+    req_end = base_date + datetime.timedelta(days=14)
+    target_end = max(min_end, req_end)
+    end_date_str = target_end.strftime("%Y-%m-%d")
 
-    base_dt = pd.to_datetime(base_date)
+    timeline = get_continuous_market_timeline(
+        variety=variety,
+        unit_qty=unit_qty,
+        model_type=model_type,
+        upload_sig=upload_sig,
+        temp_offset=temp_offset,
+        sun_offset=sun_offset,
+        rain_offset=rain_offset,
+        end_date_str=end_date_str,
+    )
 
-    # date_col 결정 (trd_clcln_ymd 우선, date 백업)
-    date_col = "trd_clcln_ymd" if "trd_clcln_ymd" in merged_r.columns else "date"
+    # 1) 과거 직전 영업일 (어제, D-1) 실측치/예측치 추출 및 지표 산출
+    target_yesterday = base_date - datetime.timedelta(days=1)
+    y_str = target_yesterday.strftime("%Y-%m-%d")
+    y_data = timeline.get(y_str, {})
 
-    # 선택일(base_date) 이전의 과거 영업 데이터 필터링
-    hist_r = merged_r[merged_r[date_col] < base_dt]
-    if hist_r.empty:
-        hist_r = merged_r
-    non_zero_r = hist_r[hist_r["is_holiday"] == 0]
-    if non_zero_r.empty:
-        non_zero_r = merged_r[merged_r["is_holiday"] == 0]
+    y_p_r = y_data.get("p_r", 10000.0)
+    y_v_r = y_data.get("v_r", 0.0)
+    y_low_r = y_data.get("low_r", y_p_r * 0.3)
+    y_high_r = y_data.get("high_r", y_p_r * 3.0)
+    y_core_low_r = y_data.get("core_low_r", y_p_r * 0.75)
+    y_core_high_r = y_data.get("core_high_r", y_p_r * 1.35)
+    y_p_w = y_data.get("p_w", 12000.0)
+    y_v_w = y_data.get("v_w", 0.0)
+    y_is_actual = y_data.get("is_actual", False)
+    y_status = y_data.get("status", "정상 개장")
+    y_chg_str = y_data.get("chg_str", "-")
+    y_tag = " (휴장)" if y_data.get("is_sun", 0) else (" (실측)" if y_is_actual else " (예상)")
 
-    date_col_w = "trd_clcln_ymd" if "trd_clcln_ymd" in merged_w.columns else "date"
-    hist_w = merged_w[merged_w[date_col_w] < base_dt]
-    if hist_w.empty:
-        hist_w = merged_w
-    non_zero_w = hist_w[hist_w["is_holiday"] == 0]
-    if non_zero_w.empty:
-        non_zero_w = merged_w[merged_w["is_holiday"] == 0]
-
-    # 과거 직전 영업일 (어제, D-1) 실측치 추출 (기준일의 바로 전날 D-1 기준)
-    target_yesterday = base_dt - datetime.timedelta(days=1)
-
-    if not non_zero_r.empty:
-        exact_yesterday_r = non_zero_r[non_zero_r[date_col] == target_yesterday]
-        if not exact_yesterday_r.empty:
-            yesterday_p_r = float(exact_yesterday_r["평균가격"].iloc[-1])
-            yesterday_v_r = float(exact_yesterday_r["총거래량"].iloc[-1])
-        else:
-            yesterday_p_r = float(non_zero_r["평균가격"].iloc[-1])
-            yesterday_v_r = float(non_zero_r["총거래량"].iloc[-1])
-    else:
-        yesterday_p_r = 15000.0
-        yesterday_v_r = 1000.0
-    yesterday_date_r = target_yesterday
-
-    if not non_zero_w.empty:
-        exact_yesterday_w = non_zero_w[non_zero_w[date_col_w] == target_yesterday]
-        if not exact_yesterday_w.empty:
-            yesterday_p_w = float(exact_yesterday_w["평균가격"].iloc[-1])
-            yesterday_v_w = float(exact_yesterday_w["총거래량"].iloc[-1])
-        else:
-            yesterday_p_w = float(non_zero_w["평균가격"].iloc[-1])
-            yesterday_v_w = float(non_zero_w["총거래량"].iloc[-1])
-    else:
-        yesterday_p_w = 18000.0
-        yesterday_v_w = 300.0
-    yesterday_date_w = target_yesterday
-
-    last_v_r = yesterday_v_r
-    last_p_r = yesterday_p_r
-    last_v_w = yesterday_v_w
-    last_p_w = yesterday_p_w
+    d2_p_r = y_data.get("prev_open_p_r", y_p_r)
+    d2_str = y_data.get("prev_open_date")
+    d2_dt = pd.to_datetime(d2_str).date() if d2_str else (target_yesterday - datetime.timedelta(days=1))
 
     yesterday_info = {
-        "yesterday_date_r": yesterday_date_r,
-        "yesterday_p_r": round(yesterday_p_r),
-        "yesterday_v_r": round(yesterday_v_r),
-        "yesterday_date_w": yesterday_date_w,
-        "yesterday_p_w": round(yesterday_p_w),
-        "yesterday_v_w": round(yesterday_v_w),
-        "yesterday_diff": round(yesterday_p_w - yesterday_p_r),
-        "yesterday_pct": round((yesterday_p_w - yesterday_p_r) / yesterday_p_r * 100, 1) if yesterday_p_r > 0 else 0.0,
+        "yesterday_date_r": target_yesterday,
+        "yesterday_p_r": round(y_p_r),
+        "yesterday_low_r": round(y_low_r),
+        "yesterday_high_r": round(y_high_r),
+        "yesterday_core_low_r": round(y_core_low_r),
+        "yesterday_core_high_r": round(y_core_high_r),
+        "yesterday_v_r": max(0, round(y_v_r)),
+        "yesterday_date_w": target_yesterday,
+        "yesterday_p_w": round(y_p_w),
+        "yesterday_v_w": max(0, round(y_v_w)),
+        "yesterday_diff": round(y_p_w - y_p_r),
+        "yesterday_pct": round((y_p_w - y_p_r) / y_p_r * 100, 1) if y_p_r > 0 else 0.0,
+        "is_yesterday_actual": y_is_actual,
+        "yesterday_status": y_status,
+        "yesterday_diff_label": y_chg_str,
+        "yesterday_diff_str": y_chg_str,
+        "yesterday_tag": y_tag,
+        "d2_price_r": round(d2_p_r),
+        "d2_date_r": d2_dt,
     }
 
-    # 평년 기상 통계치 (경매 기준)
-    weather_by_md = merged_r.groupby(["month", "day"])[["평균기온(°C)", "강수 계속시간(hr)", "10분 최다 강수량(mm)"]].mean()
-    weather_overall = merged_r[["평균기온(°C)", "강수 계속시간(hr)", "10분 최다 강수량(mm)"]].mean()
-
-    # D-Day (선택일)부터 D+7까지 총 8일 순차 예측
-    target_dates = [base_date + datetime.timedelta(days=i) for i in range(8)]
+    # 2) 오늘 (D-Day) 및 D+1 ~ D+7 예측 정보 추출
     results = []
+    for i in range(8):
+        cur_d = base_date + datetime.timedelta(days=i)
+        cur_str = cur_d.strftime("%Y-%m-%d")
+        d_item = timeline.get(cur_str, {})
 
-    # 경매 및 수의정가 슬라이딩 윈도우 시계열 버퍼 (직전 14개 영업일 실제 시계열 버퍼 유지)
-    p_win_r = list(non_zero_r["평균가격"].iloc[-14:]) if len(non_zero_r) >= 14 else [last_p_r] * 14
-    v_win_r = list(non_zero_r["총거래량"].iloc[-14:]) if len(non_zero_r) >= 14 else [last_v_r] * 14
-    p_win_w = list(non_zero_w["평균가격"].iloc[-14:]) if len(non_zero_w) >= 14 else [last_p_w] * 14
-    v_win_w = list(non_zero_w["총거래량"].iloc[-14:]) if len(non_zero_w) >= 14 else [last_v_w] * 14
+        pp_r = d_item.get("p_r", 10000.0)
+        pv_r = d_item.get("v_r", 0.0)
+        pp_w = d_item.get("p_w", 12000.0)
+        pv_w = d_item.get("v_w", 0.0)
+        price_low = d_item.get("low_r", pp_r * 0.3)
+        price_high = d_item.get("high_r", pp_r * 3.0)
+        core_low = d_item.get("core_low_r", pp_r * 0.75)
+        core_high = d_item.get("core_high_r", pp_r * 1.35)
+        is_actual_range = d_item.get("is_actual", False)
+        is_sun = d_item.get("is_sun", 0)
+        chg_str = d_item.get("chg_str", "휴장 (-)" if is_sun else "-")
 
-    tft_boost = 1.025 if "TFT" in model_type else 1.0
-
-    for i, d in enumerate(target_dates):
-        is_sun = 1 if is_market_closed(d) else 0  # 도매시장 공식 휴장일 (일요일 + 신정 1/1 + 설날·추석 공식 명절 연휴)
-
-        # 기상 추정
-        md_key = (d.month, d.day)
-        if md_key in weather_by_md.index:
-            w_vals = weather_by_md.loc[md_key].to_dict()
-        else:
-            w_vals = weather_overall.to_dict()
-
-        avg_temp = round(w_vals["평균기온(°C)"] + temp_offset, 1)
-        rain_time = max(0.0, round(w_vals["강수 계속시간(hr)"] + rain_offset, 1))
-        max_rain = max(0.0, round(w_vals["10분 최다 강수량(mm)"] + (rain_offset * 0.5), 1))
-        sun_val = max(0.0, round(float(w_vals.get("일조시간(hr)", 5.5)) + sun_offset, 1))
-
-        # A. 경매(rudao) 1단계: 거래량 예측
-        row_v_r = {
-            "평균기온(°C)": avg_temp,
-            "강수 계속시간(hr)": rain_time,
-            "10분 최다 강수량(mm)": max_rain,
-            "일조시간(hr)": sun_val,
-            "is_holiday": is_sun,
-            "year": d.year,
-            "month": d.month,
-            "day": d.day,
-            "dayofweek": d.weekday(),
-            "volume_lag_1": v_win_r[-1],
-            "volume_lag_7": v_win_r[-7],
-        }
-        for c in art_r["sub_lag_cols"]:
-            row_v_r[c] = float(hist_r[c].iloc[-1]) if c in hist_r.columns else 0.0
-
-        pv_r = 0.0 if is_sun else max(10.0, float(art_r["model_vol"].predict(pd.DataFrame([row_v_r])[art_r["vol_features"]])[0]) * tft_boost)
-
-        # A. 경매(rudao) 2단계: 가격 예측 (슬라이딩 윈도우 기반 이동평균 및 Lag 산출)
-        r3_r = float(np.mean(p_win_r[-3:]))
-        r7_r = float(np.mean(p_win_r[-7:]))
-        row_p_r = {
-            "volume_feature": pv_r,
-            "평균기온(°C)": avg_temp,
-            "강수 계속시간(hr)": rain_time,
-            "10분 최다 강수량(mm)": max_rain,
-            "일조시간(hr)": sun_val,
-            "is_holiday": is_sun,
-            "year": d.year,
-            "month": d.month,
-            "day": d.day,
-            "dayofweek": d.weekday(),
-            "price_lag_1": p_win_r[-1],
-            "price_lag_2": p_win_r[-2],
-            "price_lag_7": p_win_r[-7],
-            "price_roll_mean_3": r3_r,
-            "price_roll_mean_7": r7_r,
-        }
-        for c in art_r["sub_lag_cols"]:
-            row_p_r[c] = float(hist_r[c].iloc[-1]) if c in hist_r.columns else 0.0
-
-        pp_r = p_win_r[-1] if is_sun else max(1000.0, float(art_r["model_prc"].predict(pd.DataFrame([row_p_r])[art_r["price_features"]])[0]) * tft_boost)
-
-        # B. 수의정가(wjdrk) 1단계: 거래량 예측
-        row_v_w = {
-            "평균기온(°C)": avg_temp,
-            "강수 계속시간(hr)": rain_time,
-            "10분 최다 강수량(mm)": max_rain,
-            "일조시간(hr)": sun_val,
-            "is_holiday": is_sun,
-            "year": d.year,
-            "month": d.month,
-            "day": d.day,
-            "dayofweek": d.weekday(),
-            "volume_lag_1": v_win_w[-1],
-            "volume_lag_7": v_win_w[-7],
-        }
-        for c in art_w["sub_lag_cols"]:
-            row_v_w[c] = float(hist_w[c].iloc[-1]) if c in hist_w.columns else 0.0
-
-        pv_w = 0.0 if is_sun else max(5.0, float(art_w["model_vol"].predict(pd.DataFrame([row_v_w])[art_w["vol_features"]])[0]) * tft_boost)
-
-        # B. 수의정가(wjdrk) 2단계: 가격 예측
-        r3_w = float(np.mean(p_win_w[-3:]))
-        r7_w = float(np.mean(p_win_w[-7:]))
-        row_p_w = {
-            "volume_feature": pv_w,
-            "평균기온(°C)": avg_temp,
-            "강수 계속시간(hr)": rain_time,
-            "10분 최다 강수량(mm)": max_rain,
-            "일조시간(hr)": sun_val,
-            "is_holiday": is_sun,
-            "year": d.year,
-            "month": d.month,
-            "day": d.day,
-            "dayofweek": d.weekday(),
-            "price_lag_1": p_win_w[-1],
-            "price_lag_2": p_win_w[-2],
-            "price_lag_7": p_win_w[-7],
-            "price_roll_mean_3": r3_w,
-            "price_roll_mean_7": r7_w,
-        }
-        for c in art_w["sub_lag_cols"]:
-            row_p_w[c] = float(hist_w[c].iloc[-1]) if c in hist_w.columns else 0.0
-
-        raw_pred_w = float(art_w["model_prc"].predict(pd.DataFrame([row_p_w])[art_w["price_features"]])[0]) * tft_boost
-
-        # 수의정가(정가·수의매매)는 사전 출하 계약 단가이므로, 스팟 경매와 달리 일별 변동성이 낮고 안정적인 단가를 유지
-        if is_sun:
-            pp_w = p_win_w[-1]
-        else:
-            # 직전 계약가 중심의 완만한 조정 (저변동성 안정화: 관성 88% + 신규 트렌드 12%)
-            pp_w = max(1000.0, 0.88 * p_win_w[-1] + 0.12 * raw_pred_w)
-
-        # C. 가격 차이 및 유리 거래 채널 산출
         price_diff = pp_w - pp_r
         pct_diff = (price_diff / pp_r * 100) if pp_r > 0 else 0.0
         kg_price_r = round(pp_r / unit_qty)
@@ -870,41 +1080,38 @@ def predict_7_days(
         else:
             adv_channel = "유사 수준"
 
-        # 상하한 예측 범위 (경매 기준 신뢰구간)
-        price_std_band = pp_r * 0.08
-        price_low = max(500.0, pp_r - price_std_band)
-        price_high = pp_r + price_std_band
-
         results.append({
             "구분": "오늘 (D-Day)" if i == 0 else f"D+{i}",
-            "날짜": d.strftime("%Y-%m-%d"),
-            "요일": f"{WEEKDAY_KR[d.weekday()]}요일",
+            "날짜": cur_d.strftime("%Y-%m-%d"),
+            "요일": f"{WEEKDAY_KR[cur_d.weekday()]}요일",
             "품종": variety,
             "규격": f"{unit_qty:g}kg",
             "상태": "시장 휴장" if is_sun else "정상 개장",
             "경매 예상가 (원/상자)": round(pp_r),
             "경매 1kg 환산가 (원/kg)": kg_price_r,
-            "경매 예상 거래량 (상자)": round(pv_r),
+            "경매 예상 거래량 (상자)": max(0, round(pv_r)),
             "수의정가 예상가 (원/상자)": round(pp_w),
             "수의정가 1kg 환산가 (원/kg)": kg_price_w,
-            "수의정가 예상 거래량 (상자)": round(pv_w),
+            "수의정가 예상 거래량 (상자)": max(0, round(pv_w)),
             "가격 차이 (원/상자)": round(price_diff),
             "가격 차이율 (%)": round(pct_diff, 1),
             "1kg 가격 격차 (원/kg)": kg_diff,
             "유리 거래 방식": adv_channel,
             "예상 최저가 (원/상자)": round(price_low),
             "예상 최고가 (원/상자)": round(price_high),
-            "총 거래중량 (kg)": round((pv_r + pv_w) * unit_qty),
-            "평균기온 (°C)": avg_temp,
-            "강수 시간 (hr)": rain_time,
+            "주요 최저가 (원/상자)": round(core_low),
+            "주요 최고가 (원/상자)": round(core_high),
+            "가격범위_실측여부": is_actual_range,
+            "총 거래중량 (kg)": max(0, round((max(0.0, pv_r) + max(0.0, pv_w)) * unit_qty)),
+            "평균기온 (°C)": d_item.get("avg_temp", 15.0),
+            "강수 시간 (hr)": d_item.get("rain_time", 0.0),
+            "전일대비 변동": chg_str,
+            "전일대비_diff": d_item.get("diff_prev_p_r", 0.0),
+            "전일대비_pct": d_item.get("pct_prev_p_r", 0.0),
         })
 
-        # 시계열 순차 갱신 (슬라이딩 윈도우 큐: 휴장일에는 직전 영업일 가격/거래량 유지)
-        if not is_sun:
-            p_win_r.append(pp_r)
-            v_win_r.append(pv_r)
-            p_win_w.append(pp_w)
-            v_win_w.append(pv_w)
+    art_r = train_variety_spec_models(variety, unit_qty, model_type, channel="경매", upload_sig=upload_sig)
+    art_w = train_variety_spec_models(variety, unit_qty, model_type, channel="수의정가", upload_sig=upload_sig)
 
     return pd.DataFrame(results), art_r["metrics"], art_w["metrics"], yesterday_info
 
@@ -936,7 +1143,7 @@ def get_4_models_comparison(variety: str, unit_qty: float, base_date: datetime.d
     merged = pd.merge(merged, weather_daily, on="trd_clcln_ymd", how="left")
     merged = pd.merge(merged, sub_matrix, on="trd_clcln_ymd", how="left")
     merged["is_holiday"] = merged["총거래량"].isna().astype(int)
-    merged["총거래량"] = merged["총거래량"].fillna(0.0)
+    merged["총거래량"] = merged["총거래량"].fillna(0.0).clip(lower=0.0)
     merged["평균가격"] = merged["평균가격"].ffill().bfill()
     merged["year"] = merged["trd_clcln_ymd"].dt.year
     merged["month"] = merged["trd_clcln_ymd"].dt.month
@@ -1418,6 +1625,10 @@ with tab_forecast:
     d0_price_w = d0_row["수의정가 예상가 (원/상자)"]
     d0_diff = d0_row["가격 차이 (원/상자)"]
     d0_pct = d0_row["가격 차이율 (%)"]
+    d0_low = int(d0_row.get("예상 최저가 (원/상자)", d0_price_r * 0.7))
+    d0_high = int(d0_row.get("예상 최고가 (원/상자)", d0_price_r * 1.5))
+    d0_is_actual = bool(d0_row.get("가격범위_실측여부", False))
+    d0_range_tag = "휴장" if d0_row["상태"] == "시장 휴장" else ("실측" if d0_is_actual else "예상")
 
     d7_price_r = d7_row["경매 예상가 (원/상자)"]
     d7_price_w = d7_row["수의정가 예상가 (원/상자)"]
@@ -1432,8 +1643,8 @@ with tab_forecast:
     y_dt = yesterday_info["yesterday_date_r"]
     y_date_str = y_dt.strftime("%m/%d")
 
-    diff_y_r = d0_price_r - y_p_r
-    pct_y_r = (diff_y_r / y_p_r * 100) if y_p_r > 0 else 0.0
+    diff_y_r = d0_row.get("전일대비_diff", d0_price_r - y_p_r)
+    pct_y_r = d0_row.get("전일대비_pct", (diff_y_r / y_p_r * 100) if y_p_r > 0 else 0.0)
 
     diff_y_w = d0_price_w - y_p_w
     pct_y_w = (diff_y_w / y_p_w * 100) if y_p_w > 0 else 0.0
@@ -1467,43 +1678,240 @@ with tab_forecast:
     ]
     hist_today_vol = hist_spec[hist_spec["trd_clcln_ymd"] == sel_dt]["calculated_vol"].sum()
     if hist_today_vol > 0:
-        today_vol_val = int(hist_today_vol)
-        cum_vol_val = int(ytd_hist["calculated_vol"].sum())
+        today_vol_val = max(0, int(hist_today_vol))
+        cum_vol_val = max(0, int(ytd_hist["calculated_vol"].sum()))
     else:
-        today_vol_val = int(d0_row["경매 예상 거래량 (상자)"])
-        hist_sum = int(ytd_hist["calculated_vol"].sum())
+        today_vol_val = max(0, int(d0_row["경매 예상 거래량 (상자)"]))
+        hist_sum = max(0, int(ytd_hist["calculated_vol"].sum()))
         if hist_sum > 0:
             cum_vol_val = hist_sum + (today_vol_val if sel_dt > hist_spec["trd_clcln_ymd"].max() else 0)
         else:
             doy = sel_dt.dayofyear
             avg_cum = hist_spec[hist_spec["trd_clcln_ymd"].dt.dayofyear <= doy].groupby(hist_spec["trd_clcln_ymd"].dt.year)["calculated_vol"].sum().mean()
-            cum_vol_val = int(avg_cum) if pd.notna(avg_cum) and avg_cum > 0 else today_vol_val
+            cum_vol_val = max(0, int(avg_cum)) if pd.notna(avg_cum) and avg_cum > 0 else today_vol_val
 
-    # 상단 핵심 KPI 지표 카드 (7일 내 최고 예상 경매가 및 출하 최적일 집중 안내)
+    # 전년 대비(전년비) 가격 및 지표 계산 (1년 전 동일 시기 실측치 비교)
+    ly_dt = sel_dt - pd.DateOffset(years=1)
+    daily_hist = hist_spec.groupby("trd_clcln_ymd")["avgprc"].mean()
+    possible_ly_dates = daily_hist.index[
+        (daily_hist.index >= ly_dt - pd.Timedelta(days=7)) & 
+        (daily_hist.index <= ly_dt + pd.Timedelta(days=7))
+    ]
+    if len(possible_ly_dates) > 0:
+        closest_ly_dt = min(possible_ly_dates, key=lambda d: abs(d - ly_dt))
+        ly_price = float(daily_hist.loc[closest_ly_dt])
+        diff_ly_r = d0_price_r - ly_price
+        pct_ly_r = (diff_ly_r / ly_price * 100) if ly_price > 0 else 0.0
+        ly_found = True
+    else:
+        ly_price = None
+        diff_ly_r = 0.0
+        pct_ly_r = 0.0
+        ly_found = False
+
+    # 작년 7일 윈도우 최고가 계산 (Card 2 비교용)
+    ly_window = daily_hist[
+        (daily_hist.index >= ly_dt - pd.Timedelta(days=3)) & 
+        (daily_hist.index <= ly_dt + pd.Timedelta(days=10))
+    ]
+    if len(ly_window) > 0:
+        ly_max_price = float(ly_window.max())
+        diff_ly_max = max_price - ly_max_price
+        pct_ly_max = (diff_ly_max / ly_max_price * 100) if ly_max_price > 0 else 0.0
+        ly_max_found = True
+    else:
+        ly_max_price = ly_price if ly_found else 0.0
+        diff_ly_max = diff_ly_r
+        pct_ly_max = pct_ly_r
+        ly_max_found = ly_found
+
+    # Card 3 보조 지표 (최고가 도달 소요 일수 및 1kg 환산 단가)
+    days_to_peak = (pd.to_datetime(max_date_str) - sel_dt).days
+    peak_offset_str = f"+{days_to_peak}일 후 ({max_label})" if days_to_peak > 0 else ("당일 피크" if days_to_peak == 0 else f"{abs(days_to_peak)}일 전")
+    unit_kg_price = round(max_price / selected_unit)
+
+    # Card 4 작년 동기 누적 출하량 계산
+    ytd_ly = hist_spec[
+        (hist_spec["trd_clcln_ymd"].dt.year == ly_dt.year) & 
+        (hist_spec["trd_clcln_ymd"] <= ly_dt)
+    ]["calculated_vol"].sum()
+    if ytd_ly > 0:
+        diff_cum_vol = cum_vol_val - ytd_ly
+        pct_cum_vol = (diff_cum_vol / ytd_ly * 100)
+        ly_vol_found = True
+    else:
+        diff_cum_vol = 0.0
+        pct_cum_vol = 0.0
+        ly_vol_found = False
+
+    # 테마 색상 (초록: #2E7D32, 주황: #E65100) 증감 포맷 헬퍼 함수
+    def fmt_theme_delta(diff, pct, unit="원"):
+        if diff > 0:
+            c = "#2E7D32"  # 초록색 (상승/증가)
+            s = f"{diff:+,.0f}{unit} <span style='font-size: 0.76rem;'>▲</span> {abs(pct):.1f}%"
+        elif diff < 0:
+            c = "#E65100"  # 주황색 (하락/감소)
+            s = f"{diff:+,.0f}{unit} <span style='font-size: 0.76rem;'>▼</span> {abs(pct):.1f}%"
+        else:
+            c = "#64748B"  # 회색 (변동 없음)
+            s = f"0{unit} - 0.0%"
+        return c, s
+
+    # Card 1 증감
+    y1_lbl = "전일비"
+    if d0_row["상태"] == "시장 휴장":
+        c_y1, str_y1 = "#64748B", "휴장 (-)"
+    else:
+        c_y1, str_y1 = fmt_theme_delta(diff_y_r, pct_y_r, "원")
+    if ly_found:
+        c_ly1, str_ly1 = fmt_theme_delta(diff_ly_r, pct_ly_r, "원")
+        ly1_sub = f" <span style='font-size: 0.68rem; color: #94A3B8;' title='1년 전 동일 일자({ly_dt.strftime('%Y-%m-%d')}) 실측가 {int(ly_price):,}원 대비'>({int(ly_price):,}원)</span>"
+    else:
+        c_ly1, str_ly1 = "#64748B", "- (전년 실적 없음)"
+        ly1_sub = ""
+
+    # Card 2 증감
+    c_k2_d0, str_k2_d0 = fmt_theme_delta(diff_max_d0, pct_max_d0, "원")
+    if ly_max_found:
+        c_k2_ly, str_k2_ly = fmt_theme_delta(diff_ly_max, pct_ly_max, "원")
+        ly2_sub = f" <span style='font-size: 0.68rem; color: #94A3B8;' title='작년 동기 7일 최고 경락가 {int(ly_max_price):,}원 대비'>({int(ly_max_price):,}원)</span>"
+    else:
+        c_k2_ly, str_k2_ly = "#64748B", "- (전년 피크 없음)"
+        ly2_sub = ""
+
+    # Card 4 증감
+    if ly_vol_found:
+        c_k4_ly, str_k4_ly = fmt_theme_delta(diff_cum_vol, pct_cum_vol, "상자")
+        ly4_sub = f" <span style='font-size: 0.68rem; color: #94A3B8;' title='작년 동기 누적 출하량 {int(ytd_ly):,}상자 대비'>({int(ytd_ly):,}상자)</span>"
+    else:
+        c_k4_ly, str_k4_ly = "#64748B", "- (전년 실적 없음)"
+        ly4_sub = ""
+
+    # 상단 핵심 KPI 4대 지표 카드 통일 렌더링
     k1, k2, k3, k4 = st.columns(4)
-    k1.metric(
-        f"오늘 경매 예상가 ({selected_unit:g}kg)",
-        f"{d0_price_r:,} 원",
-        f"어제 대비 {diff_y_r:+,}원 ({pct_y_r:+.1f}%)",
-        delta_color="normal" if diff_y_r >= 0 else "inverse",
-    )
-    k2.metric(
-        "7일 내 최고 예상 경매가",
-        f"{max_price:,} 원",
-        f"오늘 대비 {diff_max_d0:+,}원 ({pct_max_d0:+.1f}%)",
-        delta_color="normal" if diff_max_d0 >= 0 else "inverse",
-    )
-    k3.metric(
-        "최고가 도달 일자 (출하 최적일)",
-        f"{max_date_str[5:]} ({max_day_str[:1]})",
-        f"{max_label} · 1kg당 {round(max_price / selected_unit):,}원",
-    )
-    k4.metric(
-        "당일 기준 누적 출하량",
-        f"{cum_vol_val:,} 상자",
-        f"오늘의 출하량 +{today_vol_val:,}상자",
-        delta_color="normal",
-    )
+    with k1:
+        st.markdown(
+            f"""
+            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 168px; min-height: 168px; max-height: 168px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <span style="font-size: 0.85rem; color: #475569; font-weight: 600;">오늘 경매 예상가 ({selected_unit:g}kg)</span>
+                        <span style="font-size: 0.72rem; font-weight: 700; color: #E65100; background: #FFF3E0; padding: 2px 7px; border-radius: 4px; border: 1px solid #FFCC80;">D-Day</span>
+                    </div>
+                    <div style="font-size: 1.95rem; font-weight: 700; color: #0F172A; line-height: 1.2; margin-bottom: 3px;">
+                        {d0_price_r:,} 원
+                    </div>
+                    <div style="font-size: 0.78rem; color: #64748B; font-weight: 500; margin-bottom: 8px;">
+                        최소 <span style="font-weight: 700; color: #0F172A;">{d0_low:,}원</span> ~ 최대 <span style="font-weight: 700; color: #0F172A;">{d0_high:,}원</span> <span style="font-size: 0.70rem; color: #94A3B8;">({d0_range_tag})</span>
+                    </div>
+                </div>
+                <div style="font-size: 0.82rem; font-weight: 600; line-height: 1.45; border-top: 1px dashed #E2E8F0; padding-top: 6px;">
+                    <div style="margin-bottom: 2px; display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">{y1_lbl}</span>
+                        <span style="color: {c_y1};">{str_y1}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">전년비{ly1_sub}</span>
+                        <span style="color: {c_ly1};">{str_ly1}</span>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with k2:
+        st.markdown(
+            f"""
+            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 168px; min-height: 168px; max-height: 168px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <span style="font-size: 0.85rem; color: #475569; font-weight: 600;">7일 내 최고 예상 경매가</span>
+                        <span style="font-size: 0.72rem; font-weight: 700; color: #2E7D32; background: #E8F5E9; padding: 2px 7px; border-radius: 4px; border: 1px solid #A5D6A7;">최고 피크</span>
+                    </div>
+                    <div style="font-size: 1.95rem; font-weight: 700; color: #0F172A; line-height: 1.2; margin-bottom: 3px;">
+                        {max_price:,} 원
+                    </div>
+                    <div style="font-size: 0.78rem; color: #64748B; font-weight: 500; margin-bottom: 8px;">
+                        피크 일자 <span style="font-weight: 700; color: #0F172A;">{max_date_str[5:]} ({max_day_str[:1]})</span> 형성 전망
+                    </div>
+                </div>
+                <div style="font-size: 0.82rem; font-weight: 600; line-height: 1.45; border-top: 1px dashed #E2E8F0; padding-top: 6px;">
+                    <div style="margin-bottom: 2px; display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">오늘 대비</span>
+                        <span style="color: {c_k2_d0};">{str_k2_d0}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">전년비{ly2_sub}</span>
+                        <span style="color: {c_k2_ly};">{str_k2_ly}</span>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with k3:
+        st.markdown(
+            f"""
+            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 168px; min-height: 168px; max-height: 168px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <span style="font-size: 0.85rem; color: #475569; font-weight: 600;">최고가 도달 일자</span>
+                        <span style="font-size: 0.72rem; font-weight: 700; color: #E65100; background: #FFF3E0; padding: 2px 7px; border-radius: 4px; border: 1px solid #FFCC80;">출하 권장</span>
+                    </div>
+                    <div style="font-size: 1.95rem; font-weight: 700; color: #0F172A; line-height: 1.2; margin-bottom: 3px;">
+                        {max_date_str[5:]} <span style="font-size: 1.25rem; font-weight: 600; color: #475569;">({max_day_str[:1]})</span>
+                    </div>
+                    <div style="font-size: 0.78rem; color: #64748B; font-weight: 500; margin-bottom: 8px;">
+                        최고 경락가 <span style="font-weight: 700; color: #0F172A;">{max_price:,}원</span> 도달 예상
+                    </div>
+                </div>
+                <div style="font-size: 0.82rem; font-weight: 600; line-height: 1.45; border-top: 1px dashed #E2E8F0; padding-top: 6px;">
+                    <div style="margin-bottom: 2px; display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">도달 시점</span>
+                        <span style="color: #2E7D32; font-weight: 700;">{peak_offset_str}</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">환산 단가</span>
+                        <span style="color: #E65100; font-weight: 700;">1kg당 {unit_kg_price:,}원</span>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+
+    with k4:
+        st.markdown(
+            f"""
+            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 168px; min-height: 168px; max-height: 168px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                        <span style="font-size: 0.85rem; color: #475569; font-weight: 600;">당일 기준 누적 출하량</span>
+                        <span style="font-size: 0.72rem; font-weight: 700; color: #2E7D32; background: #E8F5E9; padding: 2px 7px; border-radius: 4px; border: 1px solid #A5D6A7;">누적 실적</span>
+                    </div>
+                    <div style="font-size: 1.95rem; font-weight: 700; color: #0F172A; line-height: 1.2; margin-bottom: 3px;">
+                        {cum_vol_val:,} <span style="font-size: 1.15rem; font-weight: 600; color: #475569;">상자</span>
+                    </div>
+                    <div style="font-size: 0.78rem; color: #64748B; font-weight: 500; margin-bottom: 8px;">
+                        향후 7일 총 <span style="font-weight: 700; color: #0F172A;">{int(total_vol_r):,}상자</span> 출하 예상
+                    </div>
+                </div>
+                <div style="font-size: 0.82rem; font-weight: 600; line-height: 1.45; border-top: 1px dashed #E2E8F0; padding-top: 6px;">
+                    <div style="margin-bottom: 2px; display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">오늘 출하</span>
+                        <span style="color: #2E7D32; font-weight: 700;">+{today_vol_val:,} 상자</span>
+                    </div>
+                    <div style="display: flex; justify-content: space-between;">
+                        <span style="color: #64748B; font-weight: 500;">전년비{ly4_sub}</span>
+                        <span style="color: {c_k4_ly};">{str_k4_ly}</span>
+                    </div>
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 
     # 7일 내 최고 예상 경매가 출하 최적기 정보 배너
     st.markdown(
@@ -1522,28 +1930,36 @@ with tab_forecast:
         """,
         unsafe_allow_html=True,
     )
+    caption_ly_str = f", 전년비 {diff_ly_r:+,}원 ({pct_ly_r:+.1f}%)" if ly_found else ""
+    y_act_text = "실측" if yesterday_info.get("is_yesterday_actual", False) else yesterday_info.get("yesterday_status", "예상")
     st.caption(
         f"📅 선택 기준일: {selected_date.strftime('%Y-%m-%d')} ({WEEKDAY_KR[selected_date.weekday()]}요일) | "
-        f"직전 개장일(어제 {y_date_str}) 실적 대비 경매 {diff_y_r:+,}원 ({pct_y_r:+.1f}%), "
+        f"직전일(어제 {y_date_str}, {y_act_text}) 대비 경매 {diff_y_r:+,}원 ({pct_y_r:+.1f}%){caption_ly_str}, "
         f"7일 내 최고가 {max_date_str[5:]}({max_day_str[:1]}) {max_price:,}원 예상 (선택 날짜 실시간 연동)"
     )
 
     # 인터랙티브 타임라인 차트 2개 (어제 실적 ➔ 오늘 ➔ 향후 7일 가격 및 거래량)
     c_left, c_right = st.columns(2)
-    x_dates = [f"어제\n({y_date_str})"] + [f"{r['날짜'][5:]}\n({r['요일'][:1]})" for _, r in forecast_df.iterrows()]
+    y_chart_label = f"어제({y_act_text})\n({y_date_str})"
+    x_dates = [y_chart_label] + [f"{r['날짜'][5:]}\n({r['요일'][:1]})" for _, r in forecast_df.iterrows()]
     p_r_timeline = [y_p_r] + list(forecast_df["경매 예상가 (원/상자)"])
     p_w_timeline = [y_p_w] + list(forecast_df["수의정가 예상가 (원/상자)"])
-    v_r_timeline = [y_v_r] + list(forecast_df["경매 예상 거래량 (상자)"])
-    v_w_timeline = [y_v_w] + list(forecast_df["수의정가 예상 거래량 (상자)"])
+    v_r_timeline = [max(0, int(y_v_r))] + [max(0, int(v)) for v in forecast_df["경매 예상 거래량 (상자)"]]
+    v_w_timeline = [max(0, int(y_v_w))] + [max(0, int(v)) for v in forecast_df["수의정가 예상 거래량 (상자)"]]
     kg_p_r_timeline = [round(y_p_r / selected_unit)] + list(forecast_df["경매 1kg 환산가 (원/kg)"])
     kg_p_w_timeline = [round(y_p_w / selected_unit)] + list(forecast_df["수의정가 1kg 환산가 (원/kg)"])
     diff_timeline = [y_p_w - y_p_r] + list(forecast_df["가격 차이 (원/상자)"])
     pct_timeline = [yesterday_info["yesterday_pct"]] + list(forecast_df["가격 차이율 (%)"])
+    y_low_r = yesterday_info.get("yesterday_low_r", y_p_r * 0.3)
+    y_high_r = yesterday_info.get("yesterday_high_r", y_p_r * 3.0)
+    p_low_timeline = [y_low_r] + list(forecast_df["예상 최저가 (원/상자)"])
+    p_high_timeline = [y_high_r] + list(forecast_df["예상 최고가 (원/상자)"])
+    status_timeline = [y_act_text] + [("실측" if is_act else "예상") for is_act in forecast_df.get("가격범위_실측여부", [False] * len(forecast_df))]
 
     with c_left:
         fig_p = go.Figure()
 
-        # 경매(rudao) 라인 (어제 실적 ➔ 오늘 ➔ 7일 전망)
+        # 1. 경매(rudao) 라인 (어제 실적 ➔ 오늘 ➔ 7일 전망)
         fig_p.add_trace(
             go.Scatter(
                 x=x_dates,
@@ -1557,7 +1973,7 @@ with tab_forecast:
             )
         )
 
-        # 수의정가(wjdrk) 라인 (어제 실적 ➔ 오늘 ➔ 7일 전망)
+        # 2. 수의정가(wjdrk) 라인 (어제 실적 ➔ 오늘 ➔ 7일 전망)
         fig_p.add_trace(
             go.Scatter(
                 x=x_dates,
@@ -1658,38 +2074,43 @@ with tab_forecast:
 
     auction_detail_rows = []
 
-    # 1) 어제 행 (D-1 실적)
+    # 1) 어제 행 (D-1)
     y_kg_p = round(y_p_r / selected_unit)
-    y_ton = round((y_v_r * selected_unit) / 1000, 1) if y_v_r > 0 else 0.0
+    y_ton = round((max(0, y_v_r) * selected_unit) / 1000, 1) if y_v_r > 0 else 0.0
+    y_status = yesterday_info.get("yesterday_status", "실측 완료")
+    y_diff_label = yesterday_info.get("yesterday_diff_str", yesterday_info.get("yesterday_diff_label", "-"))
+    y_tag = yesterday_info.get("yesterday_tag", " (실측)")
+    if y_status == "시장 휴장":
+        y_range_str = "시장 휴장"
+    else:
+        y_range_str = f"{y_low_r:,} ~ {y_high_r:,}원{y_tag}"
+
     auction_detail_rows.append({
         "구분": "어제 (D-1)",
         "날짜": y_dt.strftime("%Y-%m-%d"),
         "요일": f"{WEEKDAY_KR[y_dt.weekday()]}요일",
-        "개장 상태": "실측 완료",
+        "개장 상태": y_status,
         "경매 경락가 (원/상자)": y_p_r,
         "1kg 환산가 (원/kg)": y_kg_p,
-        "전일대비 변동": "- (실측 기준)",
-        "예상 가격 범위 (원/상자)": f"{y_p_r:,}원 (실측 확정)",
-        "경매 거래량 (상자)": y_v_r,
+        "전일대비 변동": y_diff_label,
+        "최소 ~ 최대가 (원/상자)": y_range_str,
+        "경매 거래량 (상자)": max(0, y_v_r),
         "예상 거래중량 (톤)": y_ton,
     })
 
     # 2) 오늘 및 향후 7일 예측 행
-    prev_p = y_p_r
     for _, r in forecast_df.iterrows():
         cur_p = r["경매 예상가 (원/상자)"]
         is_sun = (r["상태"] == "시장 휴장")
+        chg_str = r.get("전일대비 변동", "휴장 (-)" if is_sun else "-")
         if is_sun:
-            chg_str = "휴장 (-)"
             range_str = "시장 휴장"
         else:
-            diff_p = cur_p - prev_p
-            pct_p = (diff_p / prev_p * 100) if prev_p > 0 else 0.0
-            chg_str = f"{diff_p:+,.0f}원 ({pct_p:+.1f}%)"
-            range_str = f"{r['예상 최저가 (원/상자)']:,} ~ {r['예상 최고가 (원/상자)']:,}원"
-            prev_p = cur_p
+            is_act = r.get("가격범위_실측여부", False)
+            tag = " (실측)" if is_act else " (예상)"
+            range_str = f"{r['예상 최저가 (원/상자)']:,} ~ {r['예상 최고가 (원/상자)']:,}원{tag}"
 
-        v_box = r["경매 예상 거래량 (상자)"]
+        v_box = max(0, int(r["경매 예상 거래량 (상자)"]))
         v_ton = round((v_box * selected_unit) / 1000, 1) if v_box > 0 else 0.0
 
         auction_detail_rows.append({
@@ -1700,7 +2121,7 @@ with tab_forecast:
             "경매 경락가 (원/상자)": cur_p,
             "1kg 환산가 (원/kg)": r["경매 1kg 환산가 (원/kg)"],
             "전일대비 변동": chg_str,
-            "예상 가격 범위 (원/상자)": range_str,
+            "최소 ~ 최대가 (원/상자)": range_str,
             "경매 거래량 (상자)": v_box,
             "예상 거래중량 (톤)": v_ton,
         })
@@ -1730,7 +2151,8 @@ with tab_forecast:
                     [
                         "color: #9E9E9E; font-style: italic;" if "휴장" in str(v)
                         else ("color: #1565C0; font-weight: bold;" if "실측" in str(v)
-                        else "color: #2E7D32; font-weight: bold;")
+                        else ("color: #6A1B9A; font-weight: bold;" if "예상" in str(v)
+                        else "color: #2E7D32; font-weight: bold;"))
                         for v in col
                     ] if col.name == "개장 상태" else ["" for _ in col]
                 )
@@ -1793,7 +2215,7 @@ with tab_forecast:
     # AI 유통 및 출하 전략 인사이트
     st.info(
         f"💡 **AI 시장 유통 & 출하 전략 인사이트 ({selected_variety} {selected_unit:g}kg):**\n"
-        f"- **어제 대비 가격 형성 추세:** 선택하신 기준일 `{selected_date.strftime('%Y-%m-%d')}`의 경매가는 어제 대비 `{diff_y_r:+,}원 ({pct_y_r:+.1f}%)`, 수의정가는 어제 대비 `{diff_y_w:+,}원 ({pct_y_w:+.1f}%)` 변동하여 형성되었습니다.\n"
+        f"- **어제 및 전년 대비 가격 형성 추세:** 선택하신 기준일 `{selected_date.strftime('%Y-%m-%d')}`의 경매가는 직전 개장일(어제) 대비 `{diff_y_r:+,}원 ({pct_y_r:+.1f}%)`" + (f", 전년 동기 대비 `{diff_ly_r:+,}원 ({pct_ly_r:+.1f}%)`" if ly_found else "") + f", 수의정가는 어제 대비 `{diff_y_w:+,}원 ({pct_y_w:+.1f}%)` 변동하여 형성되었습니다.\n"
         f"- **경매 vs 수의정가 가격 격차:** 현재 `{selected_variety} {selected_unit:g}kg` 기준, 수의정가(정가·수의매매) 계약 가격이 경매 경락가 대비 평균 **{avg_diff:+,}원 ({avg_pct:+.1f}%)** 수준의 가격 차이를 형성하고 있습니다.\n"
         f"- **출하 농가 권장 전략:** {'수의정가 채널의 가격 프리미엄이 높으므로, 대형 유통업체·온라인 플랫폼과의 사전 예약형 수의매매 계약 비중을 우선 확대하는 것이 농가 수취가격 제고에 유리합니다.' if avg_diff > 0 else '현재 스팟 경매 시장의 단기 수요 경합이 활발하므로, 도매시장 상장 경매 출하를 통해 최고가 경쟁 입찰을 유도하는 전략이 유리합니다.'}\n"
         f"- **향후 7일 수급 전망:** 적용된 `{active_engine_name}` 모델(R² {active_metric_r2:.4f}, RMSE ±{active_metric_rmse:,.0f}원) 기준, 7일간 총 출하 예상물량은 경매 `{total_vol_r:,.0f} 상자`, 수의정가 `{total_vol_w:,.0f} 상자`로 예측됩니다."
@@ -1849,6 +2271,7 @@ with tab_market:
         .reset_index()
         .sort_values("trd_clcln_ymd")
     )
+    daily_1y_r["총거래량"] = daily_1y_r["총거래량"].fillna(0.0).clip(lower=0.0)
     daily_1y_r["price_ma7"] = daily_1y_r["평균가격"].rolling(7, min_periods=1).mean()
     daily_1y_r["price_ma30"] = daily_1y_r["평균가격"].rolling(30, min_periods=1).mean()
     daily_1y_r["vol_ma7"] = daily_1y_r["총거래량"].rolling(7, min_periods=1).mean()
@@ -1889,6 +2312,7 @@ with tab_market:
         .reset_index()
         .sort_values("trd_clcln_ymd")
     )
+    daily_1y_w["총거래량"] = daily_1y_w["총거래량"].fillna(0.0).clip(lower=0.0)
 
     # 2) 정가·수의매매의 제도적 본질인 '사전 약정 계약 단가(Contract Pricing)' 반영:
     #    스팟 경매와 달리 정가수의는 통상 1~2주간 약정 단가가 안정적으로 고정·유지됨
@@ -1920,8 +2344,8 @@ with tab_market:
     cv_w = (daily_1y_w["평균가격"].std() / mean_1y_p_w * 100) if mean_1y_p_w > 0 else 0.0
     cv_diff = cv_r - cv_w
 
-    total_vol_r_1y = round(daily_1y_r["총거래량"].sum()) if not daily_1y_r.empty else 0
-    total_vol_w_1y = round(daily_1y_w["총거래량"].sum()) if not daily_1y_w.empty else 0
+    total_vol_r_1y = max(0, round(daily_1y_r["총거래량"].sum())) if not daily_1y_r.empty else 0
+    total_vol_w_1y = max(0, round(daily_1y_w["총거래량"].sum())) if not daily_1y_w.empty else 0
 
     # 1년 거래 요약 지표 카드 3개 (경매 vs 정가수의 비교 - 텍스트 잘림 방지 커스텀 카드)
     st.markdown(f"#### 🏷️ 기준일(`{selected_date.strftime('%Y-%m-%d')}`) 직전 1년 ({period_str}) [{selected_variety} {selected_unit:g}kg] 경매 vs 정가수의 실측 거래 및 가격변동성 지표")
@@ -1929,10 +2353,12 @@ with tab_market:
     with m1:
         st.markdown(
             f"""
-            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 100%;">
-                <div style="font-size: 0.86rem; font-weight: 700; color: #475569; margin-bottom: 6px;">🏛️ 경매 1년 평균 경락가</div>
-                <div style="font-size: 1.55rem; font-weight: 800; color: #1E3A8A; margin-bottom: 8px;">{mean_1y_p_r:,} <span style="font-size: 0.92rem; font-weight: 600; color: #64748B;">원 / 상자</span></div>
-                <div style="font-size: 0.82rem; color: #334155; background: #F1F5F9; border-radius: 6px; padding: 6px 10px; line-height: 1.45;">
+            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 152px; min-height: 152px; max-height: 152px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="font-size: 0.86rem; font-weight: 700; color: #475569; margin-bottom: 4px;">🏛️ 경매 1년 평균 경락가</div>
+                    <div style="font-size: 1.55rem; font-weight: 800; color: #1E3A8A; margin-bottom: 6px;">{mean_1y_p_r:,} <span style="font-size: 0.92rem; font-weight: 600; color: #64748B;">원 / 상자</span></div>
+                </div>
+                <div style="font-size: 0.82rem; color: #334155; background: #F1F5F9; border-radius: 6px; padding: 6px 10px; line-height: 1.45; min-height: 48px; box-sizing: border-box;">
                     최저 <b>{min_p_r:,}원</b> ~ 최고 <b>{max_p_r:,}원</b><br>
                     <span style="color: #64748B; font-size: 0.78rem;">(연간 가격 변동폭: {span_r:,}원)</span>
                 </div>
@@ -1943,10 +2369,12 @@ with tab_market:
     with m2:
         st.markdown(
             f"""
-            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 100%;">
-                <div style="font-size: 0.86rem; font-weight: 700; color: #475569; margin-bottom: 6px;">🤝 정가수의 1년 평균 계약가</div>
-                <div style="font-size: 1.55rem; font-weight: 800; color: #166534; margin-bottom: 8px;">{mean_1y_p_w:,} <span style="font-size: 0.92rem; font-weight: 600; color: #64748B;">원 / 상자</span></div>
-                <div style="font-size: 0.82rem; color: #334155; background: #F1F5F9; border-radius: 6px; padding: 6px 10px; line-height: 1.45;">
+            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 152px; min-height: 152px; max-height: 152px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="font-size: 0.86rem; font-weight: 700; color: #475569; margin-bottom: 4px;">🤝 정가수의 1년 평균 계약가</div>
+                    <div style="font-size: 1.55rem; font-weight: 800; color: #166534; margin-bottom: 6px;">{mean_1y_p_w:,} <span style="font-size: 0.92rem; font-weight: 600; color: #64748B;">원 / 상자</span></div>
+                </div>
+                <div style="font-size: 0.82rem; color: #334155; background: #F1F5F9; border-radius: 6px; padding: 6px 10px; line-height: 1.45; min-height: 48px; box-sizing: border-box;">
                     최저 <b>{min_p_w:,}원</b> ~ 최고 <b>{max_p_w:,}원</b><br>
                     <span style="color: #64748B; font-size: 0.78rem;">(연간 가격 변동폭: {span_w:,}원)</span>
                 </div>
@@ -1957,11 +2385,14 @@ with tab_market:
     with m3:
         st.markdown(
             f"""
-            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 100%;">
-                <div style="font-size: 0.86rem; font-weight: 700; color: #475569; margin-bottom: 6px;">📊 1년 가격 변동성 (변동계수 CV)</div>
-                <div style="font-size: 1.55rem; font-weight: 800; color: #0F172A; margin-bottom: 8px;">경매 {cv_r:.1f}% <span style="font-size: 1.0rem; font-weight: 600; color: #64748B;">vs</span> 수의 {cv_w:.1f}%</div>
-                <div style="font-size: 0.82rem; color: #166534; background: #DCFCE7; border: 1px solid #BBF7D0; border-radius: 6px; padding: 6px 10px; line-height: 1.45; font-weight: 600;">
-                    🛡️ 정가수의가 {cv_diff:.1f}%p 대폭 안정적 (저변동성)
+            <div style="background: white; border: 1.5px solid #E2E8F0; border-radius: 10px; padding: 14px 16px; box-shadow: 0 1px 3px rgba(0,0,0,0.04); height: 152px; min-height: 152px; max-height: 152px; box-sizing: border-box; display: flex; flex-direction: column; justify-content: space-between;">
+                <div>
+                    <div style="font-size: 0.86rem; font-weight: 700; color: #475569; margin-bottom: 4px;">📊 1년 가격 변동성 (변동계수 CV)</div>
+                    <div style="font-size: 1.55rem; font-weight: 800; color: #0F172A; margin-bottom: 6px;">경매 {cv_r:.1f}% <span style="font-size: 1.0rem; font-weight: 600; color: #64748B;">vs</span> 수의 {cv_w:.1f}%</div>
+                </div>
+                <div style="font-size: 0.82rem; color: #166534; background: #DCFCE7; border: 1px solid #BBF7D0; border-radius: 6px; padding: 6px 10px; line-height: 1.45; font-weight: 600; min-height: 48px; box-sizing: border-box;">
+                    🛡️ 정가수의가 <b>{cv_diff:.1f}%p</b> 대폭 안정적 (저변동성)<br>
+                    <span style="color: #15803D; font-size: 0.78rem; font-weight: 500;">(연간 시세 급등락 리스크 최소화 채널)</span>
                 </div>
             </div>
             """,
@@ -2137,7 +2568,9 @@ with tab_market:
         daily_1y_w["ym"] = daily_1y_w["trd_clcln_ymd"].dt.strftime("%Y-%m")
         
         m_r = daily_1y_r.groupby("ym").agg(경매_평균가=("평균가격", "mean"), 경매_거래량=("총거래량", "sum")).reset_index()
+        m_r["경매_거래량"] = m_r["경매_거래량"].clip(lower=0.0)
         m_w = daily_1y_w.groupby("ym").agg(정가수의_평균가=("평균가격", "mean"), 정가수의_거래량=("총거래량", "sum")).reset_index()
+        m_w["정가수의_거래량"] = m_w["정가수의_거래량"].clip(lower=0.0)
         
         m_merged = pd.merge(m_r, m_w, on="ym", how="outer").sort_values("ym").reset_index(drop=True)
         m_merged["경매_변동률(%)"] = m_merged["경매_평균가"].pct_change() * 100
@@ -2196,7 +2629,7 @@ with tab_market:
                 ] if "변동률" in col.name or "격차" in col.name else ["" for _ in col],
                 axis=0,
             ),
-            height=360,
+            height=390,
             width="stretch",
             hide_index=True,
         )
@@ -2211,8 +2644,8 @@ with tab_share:
     kat_monthly_piv = load_kat_citrus_monthly(upload_sig)
     if kat_monthly_piv is None or kat_monthly_piv.empty:
         # kat 통합 데이터가 없으면 경매 실측 데이터(auction_df)에서 4대 감귤 품종 월별 거래량을 즉시 자동 집계하여 완벽 구동!
-        df_share = auction_df.dropna(subset=["gds_sclsf_nm", "trd_clcln_ymd"]).copy()
-        df_share["calculated_vol"] = df_share["unit_tot_qty"] / df_share["unit_qty"].replace(0, 1)
+        df_share = auction_df[(auction_df["unit_tot_qty"] > 0) & (auction_df["unit_qty"] > 0)].dropna(subset=["gds_sclsf_nm", "trd_clcln_ymd"]).copy()
+        df_share["calculated_vol"] = (df_share["unit_tot_qty"] / df_share["unit_qty"].replace(0, 1)).fillna(0.0).clip(lower=0.0)
         df_share["year_month"] = df_share["trd_clcln_ymd"].dt.strftime("%Y-%m")
         kat_monthly_piv = (
             df_share.groupby(["year_month", "gds_sclsf_nm"])["calculated_vol"]
